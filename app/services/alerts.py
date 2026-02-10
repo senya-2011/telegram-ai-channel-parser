@@ -105,6 +105,36 @@ async def _process_single_post(session: AsyncSession, bot: Bot, post: Post):
         await _send_reactions_alert(session, bot, post, reactions_ratio)
 
 
+async def _enrich_alert_with_search(summary: str) -> str:
+    """Search the web for additional context about the alert topic."""
+    try:
+        if not settings.tavily_api_key:
+            return ""
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=settings.tavily_api_key)
+        response = await client.search(
+            query=summary[:200],
+            search_depth="basic",
+            max_results=3,
+            include_answer=True,
+        )
+        extra = ""
+        answer = response.get("answer")
+        if answer:
+            extra += f"\n\n🌐 <b>Доп. контекст:</b>\n{answer[:300]}\n"
+        results = response.get("results", [])[:3]
+        if results:
+            extra += "\n📎 <b>Подробнее:</b>\n"
+            for r in results:
+                title = r.get("title", "")[:50]
+                url = _escape_md_url(r.get("url", ""))
+                extra += f'• <a href="{url}">{title}</a>\n'
+        return extra
+    except Exception as e:
+        logger.debug(f"Alert enrichment failed: {e}")
+        return ""
+
+
 async def _send_similarity_alert(
     session: AsyncSession, bot: Bot, post: Post, similar_posts: list[dict]
 ):
@@ -116,22 +146,26 @@ async def _send_similarity_alert(
     similar_sources = [s["source_title"] for s in similar_posts]
     explanation = similar_posts[0]["explanation"] if similar_posts else ""
 
-    # Build links for all similar posts
+    # Build links for all similar posts (HTML format)
     links_text = ""
     if post_link:
-        links_text += f"🔗 [{source_title}]({post_link})\n"
+        links_text += f'🔗 <a href="{post_link}">{source_title}</a>\n'
     for sp in similar_posts:
         sp_source = await get_source_by_id(session, sp["post"].source_id)
         sp_link = _get_post_link(sp_source, sp["post"])
         if sp_link:
-            links_text += f"🔗 [{sp['source_title']}]({sp_link})\n"
+            links_text += f'🔗 <a href="{sp_link}">{sp["source_title"]}</a>\n'
+
+    # Enrich with web search
+    extra_context = await _enrich_alert_with_search(post.summary or post.content[:200])
 
     reason = (
         f"🔔 Похожая новость найдена в нескольких каналах!\n\n"
-        f"📰 **Новость:** {post.summary[:200]}\n\n"
-        f"📡 **Источники:** {source_title}, {', '.join(similar_sources)}\n\n"
+        f"📰 <b>Новость:</b> {post.summary[:200]}\n\n"
+        f"📡 <b>Источники:</b> {source_title}, {', '.join(similar_sources)}\n\n"
         f"{links_text}\n"
-        f"💡 **Анализ:** {explanation}"
+        f"💡 <b>Анализ:</b> {explanation}"
+        f"{extra_context}"
     )
 
     # Get all subscribers for this source
@@ -161,16 +195,20 @@ async def _send_reactions_alert(
     source = await get_source_by_id(session, post.source_id)
     source_title = source.title or source.identifier if source else "Неизвестный"
     post_link = _get_post_link(source, post)
-    link_text = f"\n🔗 [Открыть оригинал]({post_link})" if post_link else ""
+    link_text = f'\n🔗 <a href="{post_link}">Открыть оригинал</a>' if post_link else ""
+
+    # Enrich with web search
+    extra_context = await _enrich_alert_with_search(post.summary or post.content[:200])
 
     reason = (
         f"🔥 Пост с аномально высокой активностью!\n\n"
-        f"📰 **Новость:** {post.summary[:200]}\n\n"
-        f"📡 **Канал:** {source_title}\n"
-        f"👍 **Реакций:** {post.reactions_count} "
+        f"📰 <b>Новость:</b> {post.summary[:200]}\n\n"
+        f"📡 <b>Канал:</b> {source_title}\n"
+        f"👍 <b>Реакций:</b> {post.reactions_count} "
         f"(в {reactions_ratio:.1f}x раз больше среднего)\n\n"
         f"💡 Этот пост вызвал значительно больше реакций, чем обычные посты в этом канале."
         f"{link_text}"
+        f"{extra_context}"
     )
 
     subscribers = await get_subscribers_for_source(session, post.source_id)
@@ -184,6 +222,9 @@ async def _send_alert_to_user(bot: Bot, session: AsyncSession, user_id: int, tex
     telegram_ids = await get_telegram_ids_for_user(session, user_id)
     for tg_id in telegram_ids:
         try:
-            await bot.send_message(tg_id, text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Failed to send alert to tg_id={tg_id}: {e}")
+            await bot.send_message(tg_id, text, parse_mode="HTML")
+        except Exception:
+            try:
+                await bot.send_message(tg_id, text)
+            except Exception as e:
+                logger.error(f"Failed to send alert to tg_id={tg_id}: {e}")

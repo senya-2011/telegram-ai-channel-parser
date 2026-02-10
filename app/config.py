@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     similarity_threshold: float = 0.82
     reactions_multiplier: float = 3.0
 
+    # Tavily (web search for discovering new sources)
+    tavily_api_key: str = ""
+
     @property
     def database_url(self) -> str:
         return (

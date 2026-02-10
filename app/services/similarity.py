@@ -65,6 +65,12 @@ async def find_confirmed_similar_posts(
 
         result = await check_similarity(post.summary, candidate.summary)
 
+        logger.info(
+            f"  LLM similarity check: post {post.id} vs {candidate.id} "
+            f"(cosine={sim_score:.3f}) -> similar={result['is_similar']}, "
+            f"reason: {result['explanation'][:80]}"
+        )
+
         if result["is_similar"]:
             source = await get_source_by_id(session, candidate.source_id)
             source_title = source.title or source.identifier if source else "Неизвестный"
@@ -74,5 +80,10 @@ async def find_confirmed_similar_posts(
                 "explanation": result["explanation"],
                 "similarity_score": sim_score,
             })
+
+    if confirmed:
+        logger.info(f"  -> {len(confirmed)} confirmed similar posts for post {post.id}")
+    else:
+        logger.info(f"  -> LLM rejected all candidates for post {post.id}")
 
     return confirmed

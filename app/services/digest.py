@@ -14,13 +14,27 @@ def _escape_md_url(url: str) -> str:
     return url.replace("(", "%28").replace(")", "%29")
 
 
+def _clean_url(url: str) -> str:
+    """Remove UTM parameters and other tracking garbage from URLs."""
+    from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        # Remove common tracking params
+        clean_params = {k: v for k, v in params.items() if not k.startswith(("utm_", "ref", "source"))}
+        clean_query = urlencode(clean_params, doseq=True)
+        return urlunparse(parsed._replace(query=clean_query))
+    except Exception:
+        return url
+
+
 def _get_post_link(source, post) -> str:
     """Generate a link to the original post/article."""
     if source and source.type == "telegram":
         channel = source.identifier.lstrip("@")
         return f"https://t.me/{channel}/{post.external_id}"
     elif post.external_id and post.external_id.startswith("http"):
-        return _escape_md_url(post.external_id)
+        return _escape_md_url(_clean_url(post.external_id))
     return ""
 
 
@@ -61,17 +75,24 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     digest_text = await generate_digest_text(summaries)
 
     if digest_text:
-        # Append links section at the end
-        links_section = "\n\n📎 **Ссылки на оригиналы:**\n"
+        # Append links section — deduplicated by source, max 10, HTML format
+        links_section = "\n\n📎 <b>Ссылки на оригиналы:</b>\n"
+        seen_sources = set()
+        link_count = 0
         for s in summaries:
-            if s["link"]:
-                links_section += f"• [{s['source']}]({s['link']})\n"
+            if s["link"] and link_count < 10:
+                key = s["source"]
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                links_section += f'• <a href="{s["link"]}">{s["source"]}</a>\n'
+                link_count += 1
         digest_text += links_section
     else:
-        # Fallback: simple list with links
-        digest_text = "📰 **Дайджест за сегодня:**\n\n"
+        # Fallback: simple list with links, HTML format
+        digest_text = "📰 <b>Дайджест за сегодня:</b>\n\n"
         for i, s in enumerate(summaries[:10], 1):
-            link_text = f"\n🔗 [Оригинал]({s['link']})" if s["link"] else ""
-            digest_text += f"{i}. **[{s['source']}]** (👍 {s['reactions']})\n{s['summary']}{link_text}\n\n"
+            link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s["link"] else ""
+            digest_text += f'{i}. <b>{s["source"]}</b> (👍 {s["reactions"]})\n{s["summary"]}{link_text}\n\n'
 
     return digest_text

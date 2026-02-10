@@ -87,9 +87,15 @@ async def task_send_digests(bot: Bot):
                                     if len(digest_text) > 4000:
                                         chunks = [digest_text[i:i + 4000] for i in range(0, len(digest_text), 4000)]
                                         for chunk in chunks:
-                                            await bot.send_message(tg_id, chunk, parse_mode="Markdown")
+                                            try:
+                                                await bot.send_message(tg_id, chunk, parse_mode="HTML")
+                                            except Exception:
+                                                await bot.send_message(tg_id, chunk)
                                     else:
-                                        await bot.send_message(tg_id, digest_text, parse_mode="Markdown")
+                                        try:
+                                            await bot.send_message(tg_id, digest_text, parse_mode="HTML")
+                                        except Exception:
+                                            await bot.send_message(tg_id, digest_text)
                                 except Exception as e:
                                     logger.error(f"Failed to send digest to tg_id={tg_id}: {e}")
                     except Exception as e:

@@ -72,3 +72,24 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
     ])
+
+
+def digest_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти ещё источники", callback_data="discover:sources")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+    ])
+
+
+def discovered_sources_keyboard(sources: list[dict]) -> InlineKeyboardMarkup:
+    """Keyboard with discovered sources — user can subscribe to each."""
+    buttons = []
+    for i, src in enumerate(sources):
+        emoji = "📡" if src.get("type") == "telegram" else "🔗"
+        title = src["title"][:42] + "..." if len(src["title"]) > 42 else src["title"]
+        buttons.append([InlineKeyboardButton(
+            text=f"➕ {emoji} {title}",
+            callback_data=f"addsrc:{i}",
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
