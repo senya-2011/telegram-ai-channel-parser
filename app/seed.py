@@ -12,19 +12,25 @@ from app.db.repositories import get_or_create_source
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Default Telegram channels (popular Russian tech/news channels)
+# Default Telegram channels — AI / нейросети / технологии
 DEFAULT_TELEGRAM_CHANNELS = [
-    ("@durov", "Durov's Channel"),
-    ("@breakingmash", "Mash"),
-    ("@rian_ru", "РИА Новости"),
-    ("@tabordigital", "Табор Digital"),
-    ("@techcrunch_ru", "TechCrunch RU"),
+    # Дополнительные AI-каналы
+    ("@neural_network_news", "Neural Network News"),
+    ("@openai_ru", "OpenAI на русском"),
+    ("@deeplearning_ru", "Deep Learning Russia"),
+    ("@huggingface_ru", "Hugging Face RU"),
+    ("@ai_machinelearning", "AI & Machine Learning"),
+    ("@gonzo_ML", "Gonzo ML"),
+    ("@denissexy", "Denis Sexy IT — AI/ML"),
 ]
 
-# Default web sources
+# Default web sources — AI / технологии
 DEFAULT_WEB_SOURCES = [
-    ("https://habr.com/ru/flows/develop/", "Habr - Разработка"),
-    ("https://meduza.io/", "Meduza"),
+    ("https://habr.com/ru/flows/develop/", "Habr — Разработка"),
+    ("https://the-decoder.com/", "The Decoder — AI News"),
+    ("https://openai.com/blog", "OpenAI Blog"),
+    ("https://deepmind.google/blog/", "Google DeepMind Blog"),
+    ("https://huggingface.co/blog", "Hugging Face Blog"),
 ]
 
 
