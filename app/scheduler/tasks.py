@@ -78,24 +78,30 @@ async def task_send_digests(bot: Bot):
                 if current_time == user_settings.digest_time:
                     logger.info(f"[Scheduler] Sending digest to user {user.username}")
                     try:
+                        from app.bot.handlers.digest import _split_text_smart
+                        from app.bot.keyboards import digest_keyboard
+
                         digest_text = await generate_digest_for_user(session, user.id)
                         if digest_text:
                             telegram_ids = await get_telegram_ids_for_user(session, user.id)
+                            keyboard = digest_keyboard()
+                            chunks = _split_text_smart(digest_text, max_len=4000)
+
                             for tg_id in telegram_ids:
                                 try:
-                                    # Split long messages
-                                    if len(digest_text) > 4000:
-                                        chunks = [digest_text[i:i + 4000] for i in range(0, len(digest_text), 4000)]
-                                        for chunk in chunks:
-                                            try:
-                                                await bot.send_message(tg_id, chunk, parse_mode="HTML")
-                                            except Exception:
-                                                await bot.send_message(tg_id, chunk)
-                                    else:
+                                    for i, chunk in enumerate(chunks):
+                                        is_last = (i == len(chunks) - 1)
                                         try:
-                                            await bot.send_message(tg_id, digest_text, parse_mode="HTML")
+                                            await bot.send_message(
+                                                tg_id, chunk,
+                                                parse_mode="HTML",
+                                                reply_markup=keyboard if is_last else None,
+                                            )
                                         except Exception:
-                                            await bot.send_message(tg_id, digest_text)
+                                            await bot.send_message(
+                                                tg_id, chunk,
+                                                reply_markup=keyboard if is_last else None,
+                                            )
                                 except Exception as e:
                                     logger.error(f"Failed to send digest to tg_id={tg_id}: {e}")
                     except Exception as e:

@@ -56,6 +56,52 @@ async def summarize_post(content: str) -> Optional[str]:
         return None
 
 
+async def check_ai_relevance(text: str) -> bool:
+    """
+    Check if a post is a real AI/ML/tech news (not an ad, promo, or off-topic).
+    Returns True if the post is AI-relevant news, False otherwise.
+    """
+    client = get_llm_client()
+
+    # Truncate to keep it cheap and fast
+    text = text[:500]
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты — фильтр новостей. Определи, является ли текст РЕАЛЬНОЙ новостью или статьёй "
+                        "про искусственный интеллект, машинное обучение, нейросети, LLM, GPT, "
+                        "автоматизацию с помощью ИИ или связанные технологии.\n\n"
+                        "Ответь СТРОГО одним словом:\n"
+                        "YES — если это настоящая новость/статья про ИИ/ML/технологии\n"
+                        "NO — если это реклама, промо, продажа курсов, подписка на платный контент, "
+                        "личное мнение без новости, спам, или тема НЕ связана с ИИ\n\n"
+                        "Примеры NO: продажа курсов, предложение подписки, розыгрыш, "
+                        "промокод, партнёрская ссылка, набор на вебинар, вакансия."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        is_relevant = answer.startswith("YES")
+        logger.debug(f"AI relevance check: '{text[:60]}...' -> {answer} ({is_relevant})")
+        return is_relevant
+    except Exception as e:
+        logger.error(f"AI relevance check error: {e}")
+        # Default to True on error — don't lose real news
+        return True
+
+
 async def check_similarity(post1_summary: str, post2_summary: str) -> dict:
     """
     Ask LLM to confirm whether two posts are about the same news event.

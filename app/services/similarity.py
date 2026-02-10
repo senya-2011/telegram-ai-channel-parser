@@ -38,16 +38,18 @@ async def find_confirmed_similar_posts(
     if not candidates:
         return []
 
-    # Filter by cosine similarity threshold
+    # Filter by cosine similarity threshold, skip posts from the SAME source
     similar_candidates = []
+    seen_source_ids = {post.source_id}  # Skip same channel
     for candidate in candidates:
-        if candidate.embedding is not None:
+        if candidate.embedding is not None and candidate.source_id not in seen_source_ids:
             sim = cosine_similarity(
                 embedding_list,
                 list(candidate.embedding) if not isinstance(candidate.embedding, list) else candidate.embedding,
             )
             if sim >= settings.similarity_threshold:
                 similar_candidates.append((candidate, sim))
+                seen_source_ids.add(candidate.source_id)
 
     if not similar_candidates:
         return []

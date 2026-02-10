@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 # Default Telegram channels — AI / нейросети / технологии
 DEFAULT_TELEGRAM_CHANNELS = [
     # Дополнительные AI-каналы
-    ("@neural_network_news", "Neural Network News"),
     ("@openai_ru", "OpenAI на русском"),
     ("@deeplearning_ru", "Deep Learning Russia"),
     ("@huggingface_ru", "Hugging Face RU"),

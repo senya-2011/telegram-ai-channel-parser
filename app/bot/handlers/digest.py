@@ -237,3 +237,81 @@ async def add_discovered_source(
     # Update keyboard — mark subscribed
     discovered[idx]["subscribed"] = True
     await state.update_data(discovered_sources=discovered)
+
+
+@router.callback_query(F.data.startswith("alertsrc:"))
+async def search_alert_sources(callback: CallbackQuery, user: User | None, session: AsyncSession, state: FSMContext):
+    """Search for more sources about an alert topic."""
+    if not user:
+        await callback.answer("Сначала авторизуйтесь.", show_alert=True)
+        return
+
+    await callback.answer("🔍 Ищу источники...")
+
+    # Keep alert message, remove button
+    try:
+        await callback.message.edit_reply_markup(reply_markup=back_to_menu_keyboard())
+    except Exception:
+        pass
+
+    loading_msg = await callback.message.answer("🔍 Ищу источники и информацию по теме алерта...")
+
+    try:
+        from app.services.web_search import search_related_sources
+
+        # Extract topic from the alert message text
+        alert_text = callback.message.text or ""
+        # Get the news summary from the alert
+        topic_line = ""
+        for line in alert_text.split("\n"):
+            if "Новость:" in line or "новость" in line.lower():
+                topic_line = line.replace("Новость:", "").replace("📰", "").strip()
+                break
+        if not topic_line:
+            topic_line = alert_text[:150]
+
+        # Search for sources about this topic
+        topics = [topic_line[:80]]
+        discovered = await search_related_sources(topics, max_results=8)
+
+        if not discovered:
+            await loading_msg.edit_text(
+                "🤷 Не удалось найти дополнительные источники по этой теме.",
+                reply_markup=back_to_menu_keyboard(),
+            )
+            return
+
+        await state.update_data(discovered_sources=discovered)
+
+        tg_count = sum(1 for r in discovered if r.get("type") == "telegram")
+        web_count = sum(1 for r in discovered if r.get("type") == "web")
+        text = f'🔍 <b>Найдено {len(discovered)} источников по теме алерта</b> '
+        text += f'(📡 {tg_count} каналов, 🔗 {web_count} сайтов)\n\n'
+        for i, src in enumerate(discovered):
+            emoji = "📡" if src.get("type") == "telegram" else "🔗"
+            snippet = src["snippet"][:100] + "..." if len(src["snippet"]) > 100 else src["snippet"]
+            text += f'<b>{i + 1}. {emoji} {src["title"]}</b>\n{snippet}\n\n'
+
+        text += "Нажмите ➕ чтобы подписаться:"
+
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n..."
+
+        try:
+            await loading_msg.edit_text(
+                text,
+                reply_markup=discovered_sources_keyboard(discovered),
+                parse_mode="HTML",
+            )
+        except Exception:
+            await loading_msg.edit_text(
+                text,
+                reply_markup=discovered_sources_keyboard(discovered),
+            )
+
+    except Exception as e:
+        logger.error(f"Error searching alert sources: {e}")
+        await loading_msg.edit_text(
+            "❌ Ошибка при поиске. Попробуйте позже.",
+            reply_markup=back_to_menu_keyboard(),
+        )

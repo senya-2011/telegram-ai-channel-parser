@@ -81,6 +81,16 @@ def digest_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def alert_keyboard(alert_topic: str) -> InlineKeyboardMarkup:
+    """Keyboard under alerts — search for more about this topic."""
+    # Encode topic in callback data (truncate to fit Telegram's 64-byte limit)
+    topic_short = alert_topic[:40]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти ещё про это", callback_data=f"alertsrc:{hash(topic_short) % 100000}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+    ])
+
+
 def discovered_sources_keyboard(sources: list[dict]) -> InlineKeyboardMarkup:
     """Keyboard with discovered sources — user can subscribe to each."""
     buttons = []
