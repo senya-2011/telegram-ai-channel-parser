@@ -9,13 +9,18 @@ from app.services.llm_client import generate_digest_text
 logger = logging.getLogger(__name__)
 
 
+def _escape_md_url(url: str) -> str:
+    """Escape parentheses in URLs so Markdown links don't break."""
+    return url.replace("(", "%28").replace(")", "%29")
+
+
 def _get_post_link(source, post) -> str:
     """Generate a link to the original post/article."""
     if source and source.type == "telegram":
         channel = source.identifier.lstrip("@")
         return f"https://t.me/{channel}/{post.external_id}"
     elif post.external_id and post.external_id.startswith("http"):
-        return post.external_id
+        return _escape_md_url(post.external_id)
     return ""
 
 
