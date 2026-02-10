@@ -4,7 +4,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.repositories import get_posts_for_digest, get_source_by_id, get_user_sources
-from app.services.llm_client import check_ai_relevance, generate_digest_text
+from app.services.llm_client import generate_digest_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +57,26 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     if not posts:
         return None
 
-    # Prepare summaries for LLM — filter out non-AI posts
+    # Prepare summaries for LLM — fast local keyword filter (LLM check already done at processing time)
+    _AI_KW = {
+        "ai", "artificial intelligence", "ml", "machine learning", "deep learning",
+        "neural", "llm", "gpt", "chatgpt", "openai", "deepseek", "gemini", "claude",
+        "transformer", "diffusion", "нейросет", "нейронн", "искусственн",
+        "машинн обучен", "ии ", "language model", "nlp", "rag", "embedding",
+        "copilot", "midjourney", "hugging face", "модел", "автоматизац",
+    }
+
+    def _is_ai(text: str) -> bool:
+        t = text.lower()
+        return any(kw in t for kw in _AI_KW)
+
     summaries = []
     for post in posts:
         post_text = post.summary or post.content[:300]
 
-        # Filter: skip posts that are not about AI (ads, promos, off-topic)
-        is_relevant = await check_ai_relevance(post_text)
-        if not is_relevant:
-            logger.debug(f"Digest: skipping post {post.id} — not AI-relevant")
+        # Fast keyword filter — skip obvious non-AI posts
+        if not _is_ai(post_text):
+            logger.debug(f"Digest: skipping post {post.id} — not AI-relevant (keyword filter)")
             continue
 
         source = await get_source_by_id(session, post.source_id)

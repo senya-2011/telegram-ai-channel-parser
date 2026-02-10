@@ -58,6 +58,9 @@ async def task_send_digests(bot: Bot):
 
     logger.debug("[Scheduler] Checking digest schedule...")
 
+    # Step 1: Collect users whose digest time matches now
+    users_to_send: list[tuple[int, int, str]] = []  # (user_id, tg_id, username)
+
     try:
         async with async_session() as session:
             users = await get_all_users_with_settings(session)
@@ -76,39 +79,60 @@ async def task_send_digests(bot: Bot):
                 current_time = now.strftime("%H:%M")
 
                 if current_time == user_settings.digest_time:
-                    logger.info(f"[Scheduler] Sending digest to user {user.username}")
-                    try:
-                        from app.bot.handlers.digest import _split_text_smart
-                        from app.bot.keyboards import digest_keyboard
-
-                        digest_text = await generate_digest_for_user(session, user.id)
-                        if digest_text:
-                            telegram_ids = await get_telegram_ids_for_user(session, user.id)
-                            keyboard = digest_keyboard()
-                            chunks = _split_text_smart(digest_text, max_len=4000)
-
-                            for tg_id in telegram_ids:
-                                try:
-                                    for i, chunk in enumerate(chunks):
-                                        is_last = (i == len(chunks) - 1)
-                                        try:
-                                            await bot.send_message(
-                                                tg_id, chunk,
-                                                parse_mode="HTML",
-                                                reply_markup=keyboard if is_last else None,
-                                            )
-                                        except Exception:
-                                            await bot.send_message(
-                                                tg_id, chunk,
-                                                reply_markup=keyboard if is_last else None,
-                                            )
-                                except Exception as e:
-                                    logger.error(f"Failed to send digest to tg_id={tg_id}: {e}")
-                    except Exception as e:
-                        logger.error(f"Error generating digest for user {user.username}: {e}")
-
+                    telegram_ids = await get_telegram_ids_for_user(session, user.id)
+                    for tg_id in telegram_ids:
+                        users_to_send.append((user.id, tg_id, user.username))
     except Exception as e:
-        logger.error(f"[Scheduler] Digest task error: {e}")
+        logger.error(f"[Scheduler] Digest task error (collecting users): {e}")
+        return
+
+    if not users_to_send:
+        return
+
+    # Step 2: Generate and send digest for each user (separate session per user)
+    from app.bot.handlers.digest import _split_text_smart
+    from app.bot.keyboards import digest_keyboard
+
+    # Group by user_id to avoid generating digest twice for same user
+    from collections import defaultdict
+    user_tg_ids: dict[int, list[tuple[int, str]]] = defaultdict(list)  # user_id -> [(tg_id, username)]
+    for user_id, tg_id, username in users_to_send:
+        user_tg_ids[user_id].append((tg_id, username))
+
+    for user_id, tg_entries in user_tg_ids.items():
+        username = tg_entries[0][1]
+        logger.info(f"[Scheduler] Generating digest for user {username}")
+        try:
+            async with async_session() as session:
+                digest_text = await generate_digest_for_user(session, user_id)
+
+            if not digest_text:
+                logger.info(f"[Scheduler] No digest content for user {username}")
+                continue
+
+            keyboard = digest_keyboard()
+            chunks = _split_text_smart(digest_text, max_len=4000)
+
+            for tg_id, _ in tg_entries:
+                try:
+                    for i, chunk in enumerate(chunks):
+                        is_last = (i == len(chunks) - 1)
+                        try:
+                            await bot.send_message(
+                                tg_id, chunk,
+                                parse_mode="HTML",
+                                reply_markup=keyboard if is_last else None,
+                            )
+                        except Exception:
+                            await bot.send_message(
+                                tg_id, chunk,
+                                reply_markup=keyboard if is_last else None,
+                            )
+                except Exception as e:
+                    logger.error(f"Failed to send digest to tg_id={tg_id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error generating digest for user {username}: {e}")
 
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -143,6 +167,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="send_digests",
         name="Send Digests",
         replace_existing=True,
+        max_instances=3,  # allow overlap if generation takes >1 min
     )
 
     return scheduler
