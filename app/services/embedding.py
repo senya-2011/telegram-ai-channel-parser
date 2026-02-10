@@ -36,8 +36,11 @@ def generate_embedding(text: str) -> Optional[list[float]]:
         return None
 
 
-def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    a = np.array(vec1)
-    b = np.array(vec2)
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+def cosine_similarity(vec1, vec2) -> float:
+    """Compute cosine similarity between two vectors (lists or numpy arrays)."""
+    a = np.asarray(vec1, dtype=np.float32).flatten()
+    b = np.asarray(vec2, dtype=np.float32).flatten()
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    if norm == 0:
+        return 0.0
+    return float(np.dot(a, b) / norm)

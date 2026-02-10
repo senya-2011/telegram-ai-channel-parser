@@ -68,6 +68,10 @@ alembic upgrade head
 ```bash
 python -m app.seed
 ```
+(новые каналы -> 
+alembic downgrade base
+alembic upgrade head)
+
 
 ### 7. Запустите бота
 

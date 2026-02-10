@@ -31,6 +31,15 @@ async def main():
     @dp.startup()
     async def on_startup():
         logger.info("Bot is starting up...")
+
+        # Set bot commands (visible in Telegram menu button)
+        from aiogram.types import BotCommand
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Начало работы"),
+            BotCommand(command="menu", description="Открыть меню"),
+            BotCommand(command="help", description="Справка"),
+        ])
+
         scheduler.start()
         logger.info("Scheduler started")
         # Preload embedding model
@@ -39,6 +48,13 @@ async def main():
             _get_model()
         except Exception as e:
             logger.warning(f"Failed to preload embedding model: {e}")
+
+        # Run first parse immediately on startup
+        logger.info("Running initial parse...")
+        from app.scheduler.tasks import task_parse_telegram, task_parse_web
+        asyncio.create_task(task_parse_telegram(bot))
+        asyncio.create_task(task_parse_web(bot))
+
         logger.info("Bot startup complete!")
 
     @dp.shutdown()

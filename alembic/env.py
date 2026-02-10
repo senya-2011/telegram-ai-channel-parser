@@ -1,5 +1,10 @@
 import asyncio
+import sys
 from logging.config import fileConfig
+from pathlib import Path
+
+# Add project root to sys.path so 'app' module can be imported
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
@@ -10,10 +15,14 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Import models so Alembic can detect them
+# Import models and config so Alembic uses the same DB URL as the app
 from app.db.models import Base  # noqa: E402
+from app.config import settings as app_settings  # noqa: E402
 
 target_metadata = Base.metadata
+
+# Override alembic.ini URL with the one from .env (single source of truth)
+config.set_main_option("sqlalchemy.url", app_settings.database_url)
 
 
 def run_migrations_offline() -> None:
@@ -35,9 +44,9 @@ def do_run_migrations(connection):
 
 
 async def run_async_migrations():
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    from sqlalchemy.ext.asyncio import create_async_engine
+    connectable = create_async_engine(
+        app_settings.database_url,
         poolclass=pool.NullPool,
     )
     async with connectable.connect() as connection:

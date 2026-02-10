@@ -9,6 +9,16 @@ from app.services.llm_client import generate_digest_text
 logger = logging.getLogger(__name__)
 
 
+def _get_post_link(source, post) -> str:
+    """Generate a link to the original post/article."""
+    if source and source.type == "telegram":
+        channel = source.identifier.lstrip("@")
+        return f"https://t.me/{channel}/{post.external_id}"
+    elif post.external_id and post.external_id.startswith("http"):
+        return post.external_id
+    return ""
+
+
 async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optional[str]:
     """
     Generate a daily digest for a specific user.
@@ -33,20 +43,30 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     for post in posts:
         source = await get_source_by_id(session, post.source_id)
         source_title = source.title or source.identifier if source else "Неизвестный"
+        link = _get_post_link(source, post)
 
         summaries.append({
             "source": source_title,
             "summary": post.summary or post.content[:300],
             "reactions": post.reactions_count,
+            "link": link,
         })
 
     # Generate digest via LLM
     digest_text = await generate_digest_text(summaries)
 
-    if not digest_text:
-        # Fallback: simple list
+    if digest_text:
+        # Append links section at the end
+        links_section = "\n\n📎 **Ссылки на оригиналы:**\n"
+        for s in summaries:
+            if s["link"]:
+                links_section += f"• [{s['source']}]({s['link']})\n"
+        digest_text += links_section
+    else:
+        # Fallback: simple list with links
         digest_text = "📰 **Дайджест за сегодня:**\n\n"
         for i, s in enumerate(summaries[:10], 1):
-            digest_text += f"{i}. **[{s['source']}]** (👍 {s['reactions']})\n{s['summary']}\n\n"
+            link_text = f"\n🔗 [Оригинал]({s['link']})" if s["link"] else ""
+            digest_text += f"{i}. **[{s['source']}]** (👍 {s['reactions']})\n{s['summary']}{link_text}\n\n"
 
     return digest_text

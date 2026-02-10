@@ -22,13 +22,14 @@ async def find_confirmed_similar_posts(
 
     Returns list of {"post": Post, "source_title": str, "explanation": str}
     """
-    if not post.embedding or not post.summary:
+    if post.embedding is None or not post.summary:
         return []
 
     # Step 1: Vector search via pgvector
+    embedding_list = list(post.embedding) if not isinstance(post.embedding, list) else post.embedding
     candidates = await find_similar_posts(
         session,
-        embedding=post.embedding,
+        embedding=embedding_list,
         threshold=settings.similarity_threshold,
         hours=48,
         exclude_post_id=post.id,
@@ -40,8 +41,11 @@ async def find_confirmed_similar_posts(
     # Filter by cosine similarity threshold
     similar_candidates = []
     for candidate in candidates:
-        if candidate.embedding:
-            sim = cosine_similarity(post.embedding, candidate.embedding)
+        if candidate.embedding is not None:
+            sim = cosine_similarity(
+                embedding_list,
+                list(candidate.embedding) if not isinstance(candidate.embedding, list) else candidate.embedding,
+            )
             if sim >= settings.similarity_threshold:
                 similar_candidates.append((candidate, sim))
 
