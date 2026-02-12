@@ -23,7 +23,7 @@ bcrypt==4.2.1
 # Config
 pydantic-settings==2.7.1
 # Web search
-tavily-python==0.5.0
+tavily-python==0.7.21
 # Misc
 python-dotenv==1.0.1
 pytz==2024.2
