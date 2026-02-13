@@ -2,11 +2,13 @@ import datetime
 from typing import Optional, Sequence
 
 import bcrypt
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Alert,
+    NewsCluster,
     Post,
     Source,
     User,
@@ -168,6 +170,7 @@ async def create_post(
     content: str,
     reactions_count: int = 0,
     published_at: Optional[datetime.datetime] = None,
+    commit: bool = True,
 ) -> Optional[Post]:
     # Check duplicate
     result = await session.execute(
@@ -183,7 +186,10 @@ async def create_post(
         published_at=published_at,
     )
     session.add(post)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return post
 
 
@@ -193,6 +199,10 @@ async def update_post_analysis(
     summary: Optional[str] = None,
     embedding: Optional[list] = None,
     reactions_ratio: Optional[float] = None,
+    normalized_hash: Optional[str] = None,
+    is_ai_relevant: Optional[bool] = None,
+    cluster_id: Optional[int] = None,
+    commit: bool = True,
 ) -> None:
     result = await session.execute(select(Post).where(Post.id == post_id))
     post = result.scalar_one_or_none()
@@ -204,7 +214,14 @@ async def update_post_analysis(
         post.embedding = embedding
     if reactions_ratio is not None:
         post.reactions_ratio = reactions_ratio
-    await session.commit()
+    if normalized_hash is not None:
+        post.normalized_hash = normalized_hash
+    if is_ai_relevant is not None:
+        post.is_ai_relevant = is_ai_relevant
+    if cluster_id is not None:
+        post.cluster_id = cluster_id
+    if commit:
+        await session.commit()
 
 
 async def get_unprocessed_posts(session: AsyncSession, limit: int = 50) -> Sequence[Post]:
@@ -212,6 +229,39 @@ async def get_unprocessed_posts(session: AsyncSession, limit: int = 50) -> Seque
         select(Post).where(Post.summary.is_(None)).order_by(Post.parsed_at.asc()).limit(limit)
     )
     return result.scalars().all()
+
+
+async def get_recent_post_by_hash(
+    session: AsyncSession,
+    normalized_hash: str,
+    hours: int = 72,
+) -> Optional[Post]:
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+    result = await session.execute(
+        select(Post)
+        .where(
+            Post.normalized_hash == normalized_hash,
+            Post.summary.isnot(None),
+            Post.parsed_at >= cutoff,
+        )
+        .order_by(Post.parsed_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_existing_external_ids(
+    session: AsyncSession,
+    source_id: int,
+    external_ids: list[str],
+) -> set[str]:
+    if not external_ids:
+        return set()
+    result = await session.execute(
+        select(Post.external_id)
+        .where(Post.source_id == source_id, Post.external_id.in_(external_ids))
+    )
+    return {row[0] for row in result.all() if row[0]}
 
 
 async def find_similar_posts(
@@ -266,6 +316,224 @@ async def get_source_by_id(session: AsyncSession, source_id: int) -> Optional[So
     return result.scalar_one_or_none()
 
 
+async def get_sources_by_ids(session: AsyncSession, source_ids: list[int]) -> dict[int, Source]:
+    if not source_ids:
+        return {}
+    result = await session.execute(select(Source).where(Source.id.in_(source_ids)))
+    items = result.scalars().all()
+    return {item.id: item for item in items}
+
+
+# ──────────────────────── News Clusters ────────────────────────
+
+def _merge_source_ids(existing: str, source_id: int) -> str:
+    source_set = {part for part in existing.split(",") if part}
+    source_set.add(str(source_id))
+    return ",".join(sorted(source_set, key=int))
+
+
+def _merge_tags(existing: str, incoming: list[str] | None) -> str:
+    tags = {tag.strip() for tag in (existing or "").split(",") if tag.strip()}
+    if incoming:
+        tags.update(tag.strip() for tag in incoming if tag and tag.strip())
+    return ",".join(sorted(tags))
+
+
+async def get_cluster_by_hash(session: AsyncSession, canonical_hash: str) -> Optional[NewsCluster]:
+    result = await session.execute(
+        select(NewsCluster).where(NewsCluster.canonical_hash == canonical_hash)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_cluster_by_id(session: AsyncSession, cluster_id: int) -> Optional[NewsCluster]:
+    result = await session.execute(select(NewsCluster).where(NewsCluster.id == cluster_id))
+    return result.scalar_one_or_none()
+
+
+async def create_news_cluster(
+    session: AsyncSession,
+    canonical_hash: str,
+    canonical_text: str,
+    canonical_summary: str,
+    embedding: Optional[list],
+    source_id: int,
+    is_ai_relevant: bool = True,
+    coreai_score: float = 0.0,
+    coreai_reason: str = "",
+    tags: list[str] | None = None,
+) -> NewsCluster:
+    cluster = NewsCluster(
+        canonical_hash=canonical_hash,
+        canonical_text=canonical_text,
+        canonical_summary=canonical_summary,
+        embedding=embedding,
+        is_ai_relevant=is_ai_relevant,
+        mention_count=1,
+        source_ids=str(source_id),
+        coreai_score=coreai_score,
+        coreai_reason=coreai_reason,
+        tags=_merge_tags("", tags),
+    )
+    session.add(cluster)
+    try:
+        await session.commit()
+        return cluster
+    except IntegrityError:
+        await session.rollback()
+        existing = await get_cluster_by_hash(session, canonical_hash)
+        if existing is None:
+            raise
+        return existing
+
+
+async def attach_post_to_cluster(
+    session: AsyncSession,
+    post: Post,
+    cluster: NewsCluster,
+    normalized_hash: Optional[str] = None,
+    is_ai_relevant: Optional[bool] = None,
+    tags: list[str] | None = None,
+    commit: bool = True,
+) -> None:
+    post.cluster_id = cluster.id
+    post.summary = cluster.canonical_summary
+    if cluster.embedding is not None:
+        post.embedding = cluster.embedding
+    if normalized_hash is not None:
+        post.normalized_hash = normalized_hash
+    if is_ai_relevant is not None:
+        post.is_ai_relevant = is_ai_relevant
+
+    cluster.mention_count = (cluster.mention_count or 0) + 1
+    cluster.source_ids = _merge_source_ids(cluster.source_ids or "", post.source_id)
+    cluster.tags = _merge_tags(cluster.tags or "", tags)
+    cluster.updated_at = datetime.datetime.utcnow()
+    if commit:
+        await session.commit()
+
+
+async def find_similar_clusters(
+    session: AsyncSession,
+    embedding: list,
+    threshold: float = 0.84,
+    hours: int = 96,
+    limit: int = 5,
+) -> list[NewsCluster]:
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+    result = await session.execute(
+        select(NewsCluster)
+        .where(
+            NewsCluster.embedding.isnot(None),
+            NewsCluster.created_at >= cutoff,
+            NewsCluster.is_ai_relevant == True,
+        )
+        .order_by(NewsCluster.embedding.cosine_distance(embedding))
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def get_pending_clusters_for_alerts(
+    session: AsyncSession,
+    min_mentions: int = 2,
+    limit: int = 20,
+) -> Sequence[NewsCluster]:
+    result = await session.execute(
+        select(NewsCluster)
+        .where(
+            NewsCluster.is_ai_relevant == True,
+            NewsCluster.mention_count >= min_mentions,
+            NewsCluster.alert_sent_at.is_(None),
+        )
+        .order_by(NewsCluster.updated_at.asc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def mark_cluster_alert_sent(session: AsyncSession, cluster_id: int) -> None:
+    result = await session.execute(select(NewsCluster).where(NewsCluster.id == cluster_id))
+    cluster = result.scalar_one_or_none()
+    if cluster is None:
+        return
+    cluster.alert_sent_at = datetime.datetime.utcnow()
+    cluster.popularity_notified_mentions = max(
+        cluster.popularity_notified_mentions or 0,
+        cluster.mention_count or 0,
+    )
+    await session.commit()
+
+
+async def get_posts_for_cluster(session: AsyncSession, cluster_id: int, limit: int = 20) -> Sequence[Post]:
+    result = await session.execute(
+        select(Post)
+        .where(Post.cluster_id == cluster_id)
+        .order_by(Post.published_at.desc().nullslast(), Post.parsed_at.desc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def get_clusters_by_ids(session: AsyncSession, cluster_ids: list[int]) -> dict[int, NewsCluster]:
+    if not cluster_ids:
+        return {}
+    result = await session.execute(select(NewsCluster).where(NewsCluster.id.in_(cluster_ids)))
+    clusters = result.scalars().all()
+    return {cluster.id: cluster for cluster in clusters}
+
+
+def _next_popularity_threshold(mentions: int) -> int | None:
+    # Sparse thresholds to avoid spam and only notify on meaningful growth.
+    thresholds = (3, 5, 8, 13, 21, 34, 55, 89)
+    for value in thresholds:
+        if mentions >= value:
+            candidate = value
+    return candidate if "candidate" in locals() else None
+
+
+async def get_clusters_for_popularity_updates(
+    session: AsyncSession,
+    limit: int = 20,
+) -> Sequence[NewsCluster]:
+    result = await session.execute(
+        select(NewsCluster)
+        .where(
+            NewsCluster.alert_sent_at.isnot(None),
+            NewsCluster.mention_count >= 3,
+        )
+        .order_by(NewsCluster.updated_at.asc())
+        .limit(limit * 3)
+    )
+    clusters = result.scalars().all()
+
+    eligible: list[NewsCluster] = []
+    for cluster in clusters:
+        target = _next_popularity_threshold(cluster.mention_count or 0)
+        if target is None:
+            continue
+        if (cluster.popularity_notified_mentions or 0) >= target:
+            continue
+        eligible.append(cluster)
+        if len(eligible) >= limit:
+            break
+    return eligible
+
+
+async def mark_cluster_popularity_notified(
+    session: AsyncSession,
+    cluster_id: int,
+    mentions: int,
+) -> None:
+    result = await session.execute(select(NewsCluster).where(NewsCluster.id == cluster_id))
+    cluster = result.scalar_one_or_none()
+    if cluster is None:
+        return
+    cluster.popularity_notified_mentions = max(cluster.popularity_notified_mentions or 0, mentions)
+    cluster.updated_at = datetime.datetime.utcnow()
+    await session.commit()
+
+
 # ──────────────────────── Alerts ────────────────────────
 
 async def create_alert(
@@ -305,6 +573,20 @@ async def get_subscribers_for_source(session: AsyncSession, source_id: int) -> S
         .where(UserSource.source_id == source_id)
     )
     return result.scalars().all()
+
+
+async def get_subscribers_for_sources(session: AsyncSession, source_ids: list[int]) -> dict[int, list[User]]:
+    if not source_ids:
+        return {}
+    result = await session.execute(
+        select(UserSource.source_id, User)
+        .join(User, User.id == UserSource.user_id)
+        .where(UserSource.source_id.in_(source_ids))
+    )
+    mapping: dict[int, list[User]] = {sid: [] for sid in source_ids}
+    for source_id, user in result.all():
+        mapping.setdefault(source_id, []).append(user)
+    return mapping
 
 
 async def get_telegram_ids_for_user(session: AsyncSession, user_id: int) -> list[int]:

@@ -8,7 +8,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.db.database import async_session
-from app.db.repositories import create_post, get_all_sources
+from app.db.repositories import create_post, get_all_sources, get_existing_external_ids
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +43,26 @@ async def _parse_single_web_source(session, source_id: int, url: str):
         return
 
     new_count = 0
+    external_ids = [article["url"] for article in articles if article.get("url")]
+    existing_ids = await get_existing_external_ids(session, source_id=source_id, external_ids=external_ids)
     for article in articles:
+        article_url = article.get("url")
+        if not article_url or article_url in existing_ids:
+            continue
         post = await create_post(
             session=session,
             source_id=source_id,
-            external_id=article["url"],
+            external_id=article_url,
             content=article["content"],
             reactions_count=0,
             published_at=article.get("published_at"),
+            commit=False,
         )
         if post:
             new_count += 1
 
     if new_count > 0:
+        await session.commit()
         logger.info(f"Parsed {new_count} new articles from {url}")
 
 

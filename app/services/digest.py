@@ -3,7 +3,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.repositories import get_posts_for_digest, get_source_by_id, get_user_sources
+from app.db.repositories import get_clusters_by_ids, get_posts_for_digest, get_source_by_id, get_user_sources
 from app.services.llm_client import generate_digest_text
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,60 @@ def _get_post_link(source, post) -> str:
     return ""
 
 
+def _short_headline(text: str, limit: int = 72) -> str:
+    raw = (text or "").strip().replace("\n", " ")
+    if not raw:
+        return "Подробнее"
+    sentence = raw.split(".")[0].strip()
+    if len(sentence) > limit:
+        sentence = sentence[:limit].rsplit(" ", 1)[0].strip() + "..."
+    return sentence or "Подробнее"
+
+
+def _inject_curated_links_inline(digest_text: str, items: list[dict]) -> str:
+    """
+    Add "Подробнее" line under each bullet in curated sections:
+    - "Главное"
+    - "Также интересно"
+    Mapping is positional: bullets in these sections are mapped to items with links.
+    """
+    if not digest_text or not items:
+        return digest_text
+
+    lines = digest_text.split("\n")
+    out: list[str] = []
+    in_curated = False
+    item_idx = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("🔥 <b>Главное:</b>"):
+            in_curated = True
+            out.append(line)
+            continue
+        if stripped.startswith("📌 <b>Также интересно:"):
+            in_curated = True
+            out.append(line)
+            continue
+        if stripped.startswith("🧷 <b>Новости по источникам:</b>"):
+            in_curated = False
+            out.append(line)
+            continue
+
+        out.append(line)
+
+        if in_curated and stripped.startswith("- "):
+            while item_idx < len(items) and not items[item_idx].get("link"):
+                item_idx += 1
+            if item_idx < len(items):
+                link = items[item_idx]["link"]
+                title = _short_headline(items[item_idx].get("summary", ""), limit=56)
+                out.append(f'🔗 <a href="{link}">Подробнее: {title}</a>')
+                item_idx += 1
+
+    return "\n".join(out)
+
+
 async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optional[str]:
     """
     Generate a daily digest for a specific user.
@@ -57,6 +111,19 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     if not posts:
         return None
 
+    # Keep one representative post per cluster to avoid duplicate copy-pastes in digest.
+    unique_posts = []
+    seen_keys = set()
+    for post in posts:
+        dedup_key = f"cluster:{post.cluster_id}" if post.cluster_id else f"post:{post.id}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        unique_posts.append(post)
+
+    cluster_ids = [p.cluster_id for p in unique_posts if p.cluster_id]
+    clusters_map = await get_clusters_by_ids(session, cluster_ids)
+
     # Prepare summaries for LLM — fast local keyword filter (LLM check already done at processing time)
     _AI_KW = {
         "ai", "artificial intelligence", "ml", "machine learning", "deep learning",
@@ -71,7 +138,7 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
         return any(kw in t for kw in _AI_KW)
 
     summaries = []
-    for post in posts:
+    for post in unique_posts:
         post_text = post.summary or post.content[:300]
 
         # Fast keyword filter — skip obvious non-AI posts
@@ -82,36 +149,43 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
         source = await get_source_by_id(session, post.source_id)
         source_title = source.title or source.identifier if source else "Неизвестный"
         link = _get_post_link(source, post)
+        cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        mentions = cluster.mention_count if cluster else 1
+        tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
 
         summaries.append({
             "source": source_title,
             "summary": post_text,
             "reactions": post.reactions_count,
             "link": link,
+            "mentions": mentions,
+            "tags": tags_text,
         })
 
     # Generate digest via LLM
     digest_text = await generate_digest_text(summaries)
 
     if digest_text:
-        # Append links section — deduplicated by source, max 10, HTML format
-        links_section = "\n\n📎 <b>Ссылки на оригиналы:</b>\n"
-        seen_sources = set()
-        link_count = 0
-        for s in summaries:
-            if s["link"] and link_count < 10:
-                key = s["source"]
-                if key in seen_sources:
-                    continue
-                seen_sources.add(key)
-                links_section += f'• <a href="{s["link"]}">{s["source"]}</a>\n'
-                link_count += 1
-        digest_text += links_section
+        digest_text = _inject_curated_links_inline(digest_text, summaries)
+
+        # Deterministic per-news section with inline tags (LLM output may reorder/omit markers).
+        per_news_section = "\n\n🧷 <b>Новости по источникам:</b>\n"
+        for i, s in enumerate(summaries[:10], 1):
+            mentions_text = f" | 📈 {s['mentions']} источн." if s.get("mentions", 1) >= 2 else ""
+            short_summary = (s["summary"] or "")[:180]
+            link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s.get("link") else ""
+            per_news_section += (
+                f'{i}. <b>{s["source"]}</b>\n'
+                f'🏷 {s.get("tags") or "#AIТехнологии"}{mentions_text}\n'
+                f'{short_summary}{link_text}\n\n'
+            )
+        digest_text += per_news_section
     else:
         # Fallback: simple list with links, HTML format
         digest_text = "📰 <b>Дайджест за сегодня:</b>\n\n"
         for i, s in enumerate(summaries[:10], 1):
             link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s["link"] else ""
-            digest_text += f'{i}. <b>{s["source"]}</b> (👍 {s["reactions"]})\n{s["summary"]}{link_text}\n\n'
+            mentions_text = f", {s['mentions']} источн." if s.get("mentions", 1) >= 2 else ""
+            digest_text += f'{i}. <b>{s["source"]}</b> (👍 {s["reactions"]}{mentions_text})\n{s["summary"]}{link_text}\n\n'
 
     return digest_text

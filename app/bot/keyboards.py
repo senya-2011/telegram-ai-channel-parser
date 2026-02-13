@@ -74,10 +74,16 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def back_to_menu_new_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")],
+    ])
+
+
 def digest_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Найти ещё источники", callback_data="discover:sources")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")],
     ])
 
 
@@ -87,7 +93,7 @@ def alert_keyboard(alert_topic: str) -> InlineKeyboardMarkup:
     topic_short = alert_topic[:40]
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Найти ещё про это", callback_data=f"alertsrc:{hash(topic_short) % 100000}")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")],
     ])
 
 
@@ -101,5 +107,5 @@ def discovered_sources_keyboard(sources: list[dict]) -> InlineKeyboardMarkup:
             text=f"➕ {emoji} {title}",
             callback_data=f"addsrc:{i}",
         )])
-    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)

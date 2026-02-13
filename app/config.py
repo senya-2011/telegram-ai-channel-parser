@@ -25,13 +25,22 @@ class Settings(BaseSettings):
     # Parsing intervals (minutes)
     telegram_parse_interval: int = 10
     web_parse_interval: int = 30
+    api_source_max_items: int = 20
+    api_source_lookback_hours: int = 48
 
     # Alerts
     similarity_threshold: float = 0.82
     reactions_multiplier: float = 3.0
+    cluster_min_mentions: int = 2
+    coreai_alert_threshold: float = 0.6
 
     # Tavily (web search for discovering new sources)
     tavily_api_key: str = ""
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    reddit_user_agent: str = "telegram-ai-parser/1.0"
+    github_api_key: str = ""
+    producthunt_api_key: str = ""
 
     @property
     def database_url(self) -> str:

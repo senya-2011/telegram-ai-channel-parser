@@ -15,6 +15,9 @@ graph TB
         WEB_SITES[Веб-сайты / RSS]
         DEEPSEEK[DeepSeek API]
         TAVILY[Tavily API]
+        REDDIT[Reddit API]
+        GITHUB[GitHub API]
+        PRODUCTHUNT[Product Hunt API]
     end
 
     subgraph bot_app [Приложение]
@@ -61,6 +64,9 @@ graph TB
     DIGEST_S -->|генерация текста| LLM
     SEARCH -->|каналы| TG_CHANNELS
     SEARCH -->|веб| TAVILY
+    SEARCH -->|reddit| REDDIT
+    SEARCH -->|github| GITHUB
+    SEARCH -->|product hunt| PRODUCTHUNT
     SCHEDULER --> TG_PARSER
     SCHEDULER --> WEB_PARSER
     SCHEDULER --> ALERTS
@@ -79,20 +85,25 @@ graph TB
 
 ```mermaid
 flowchart TD
-    A[Новый пост из канала/сайта] --> B[DeepSeek: саммари 2-3 предложения]
-    B --> C{DeepSeek: это новость про ИИ?}
+    A[Новый пост из канала/сайта] --> A1[Нормализация + hash дедуп]
+    A1 --> A2{Есть дубль в БД?}
+    A2 -->|Да| A3[Переиспользовать анализ и кластер]
+    A2 -->|Нет| B[DeepSeek: summary + relevance + CoreAI score + tags]
+    B --> C{is_relevant?}
     C -->|NO: реклама / промо / офтоп| D[Сохранить в БД, пропустить алерты]
     C -->|YES: реальная ИИ-новость| E[sentence-transformers: embedding 384-dim]
-    E --> F[Сохранить summary + embedding в БД]
-    F --> G[pgvector: найти похожие посты за 48ч]
-    G --> H{Есть кандидаты с cosine >= 0.82?}
+    E --> F[Сохранить пост + кластер + теги в БД]
+    A3 --> G[Поиск/обновление кластера]
+    F --> G[Поиск/обновление кластера]
+    G --> G1[pgvector: найти похожие кластеры за 96ч]
+    G1 --> H{Есть кандидаты с cosine >= 0.82?}
     H -->|Нет| I[Проверить аномалию реакций]
-    H -->|Да| J[DeepSeek: подтвердить что это ОДНА новость]
+    H -->|Да| J[DeepSeek: точечная проверка спорных кандидатов]
     J --> K{LLM подтвердил?}
     K -->|Нет| I
     K -->|Да| L[Кластеризация: объединить все похожие в один алерт]
     L --> M[Tavily: найти контекст из других источников]
-    M --> N[Отправить сводный алерт пользователю]
+    M --> N[Отправить сводный алерт пользователю + теги]
     N --> I
     I --> O{Реакций в 3x+ раз больше среднего?}
     O -->|Нет| P[Готово]
@@ -131,7 +142,8 @@ flowchart LR
 
 ## Кластеризация алертов
 
-Если одна новость найдена в 3+ каналах за один скан, отправляется один сводный алерт:
+Если одна новость найдена в нескольких источниках, отправляется один сводный алерт.  
+Дальше при росте этого же кластера отправляется trend-update ("новость набирает популярность").
 
 ```mermaid
 flowchart TD
@@ -163,6 +175,7 @@ erDiagram
     User ||--o{ Alert : "алерты"
     Source ||--o{ UserSource : "подписчики"
     Source ||--o{ Post : "посты"
+    NewsCluster ||--o{ Post : "посты в кластере"
     Post ||--o{ Alert : "алерты"
 
     User {
@@ -202,21 +215,39 @@ erDiagram
     Post {
         int id PK
         int source_id FK
+        int cluster_id FK
         string external_id "msg_id / URL"
         text content
+        string normalized_hash
         text summary "DeepSeek"
         vector embedding "384-dim"
+        bool is_ai_relevant
         int reactions_count
         float reactions_ratio
         datetime published_at
         datetime parsed_at
     }
 
+    NewsCluster {
+        int id PK
+        string canonical_hash UK
+        text canonical_text
+        text canonical_summary
+        string tags "comma-separated hashtags"
+        vector embedding
+        int mention_count
+        text source_ids
+        float coreai_score
+        text coreai_reason
+        datetime alert_sent_at
+        int popularity_notified_mentions
+    }
+
     Alert {
         int id PK
         int user_id FK
         int post_id FK
-        string alert_type "similar / reactions"
+        string alert_type "similar / reactions / trend"
         text reason
         bool is_sent
         datetime created_at
@@ -279,9 +310,10 @@ graph LR
 | **PostgreSQL + pgvector** | Хранение данных + векторный поиск | Одна БД для всего: данные + cosine similarity |
 | **SQLAlchemy 2.0 + asyncpg** | ORM + async драйвер | Типизированные модели, async/await |
 | **Alembic** | Миграции БД | Версионирование схемы базы |
-| **DeepSeek API** | LLM для анализа текста | Суммаризация, сравнение, фильтрация, дайджест |
+| **DeepSeek API** | LLM для анализа текста | Единый анализ: summary + relevance + CoreAI score + tags, сравнение, дайджест |
 | **sentence-transformers** | Локальные embeddings (all-MiniLM-L6-v2) | Быстро, бесплатно, 384-dim вектор |
 | **Tavily API** | Веб-поиск | Поиск контекста для алертов, новых источников |
+| **Reddit / GitHub / Product Hunt API** | Discovery источников | Поиск новых источников по API-ключам |
 | **APScheduler** | Планировщик задач | Периодический парсинг, отправка дайджестов |
 | **httpx + feedparser + BS4** | Парсинг веб-сайтов | RSS-ленты + fallback на HTML scraping |
 | **bcrypt** | Хеширование паролей | Безопасное хранение паролей пользователей |
@@ -315,10 +347,10 @@ sequenceDiagram
     Parser->>DB: Сохранить новые посты
 
     Sched->>AI: Обработать посты
-    AI->>AI: Саммари -> Фильтр ИИ -> Embedding
-    AI->>DB: Сохранить анализ
-    AI->>DB: Поиск похожих (pgvector)
-    AI->>AI: LLM подтверждение
+    AI->>AI: normalize+dedup -> единый LLM-анализ -> embedding
+    AI->>DB: Сохранить анализ + кластер + теги
+    AI->>DB: Поиск похожих кластеров (pgvector)
+    AI->>AI: LLM подтверждение (только для спорных кейсов)
     AI->>Bot: Отправить алерт
 
     Bot->>User: Алерт: похожая новость в 3 каналах!

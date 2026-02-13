@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import back_to_menu_keyboard, digest_keyboard, discovered_sources_keyboard
+from app.bot.keyboards import back_to_menu_new_keyboard, digest_keyboard, discovered_sources_keyboard
 from app.db.models import User
 from app.db.repositories import (
     get_or_create_source,
@@ -107,7 +107,7 @@ async def show_digest(callback: CallbackQuery, user: User | None, session: Async
         logger.error(f"Error generating digest: {e}")
         await callback.message.edit_text(
             "❌ Ошибка при формировании дайджеста. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_to_menu_new_keyboard(),
         )
 
 
@@ -119,12 +119,6 @@ async def discover_sources(callback: CallbackQuery, user: User | None, session: 
         return
 
     await callback.answer("🔍 Ищу источники...")
-
-    # Remove the button from the digest message so it's not clicked again, but keep the text
-    try:
-        await callback.message.edit_reply_markup(reply_markup=back_to_menu_keyboard())
-    except Exception:
-        pass
 
     # Send a NEW loading message (digest stays untouched above)
     loading_msg = await callback.message.answer("🔍 Ищу новые источники по вашим темам...")
@@ -143,7 +137,7 @@ async def discover_sources(callback: CallbackQuery, user: User | None, session: 
             await loading_msg.edit_text(
                 "📭 Недостаточно данных для поиска — нужны посты за сегодня.\n"
                 "Попробуйте позже, когда накопятся новости.",
-                reply_markup=back_to_menu_keyboard(),
+                reply_markup=back_to_menu_new_keyboard(),
             )
             return
 
@@ -156,7 +150,7 @@ async def discover_sources(callback: CallbackQuery, user: User | None, session: 
         if not discovered:
             await loading_msg.edit_text(
                 "🤷 Не удалось найти новые источники. Попробуйте позже.",
-                reply_markup=back_to_menu_keyboard(),
+                reply_markup=back_to_menu_new_keyboard(),
             )
             return
 
@@ -165,8 +159,8 @@ async def discover_sources(callback: CallbackQuery, user: User | None, session: 
 
         # Format results in HTML
         tg_count = sum(1 for r in discovered if r.get("type") == "telegram")
-        web_count = sum(1 for r in discovered if r.get("type") == "web")
-        text = f'🔍 <b>Найдено {len(discovered)} источников</b> (📡 {tg_count} каналов, 🔗 {web_count} сайтов)\n'
+        non_tg_count = len(discovered) - tg_count
+        text = f'🔍 <b>Найдено {len(discovered)} источников</b> (📡 {tg_count} каналов, 🔗 {non_tg_count} API/Web)\n'
         text += f'<i>Темы: {", ".join(topics)}</i>\n\n'
         for i, src in enumerate(discovered):
             emoji = "📡" if src.get("type") == "telegram" else "🔗"
@@ -194,7 +188,7 @@ async def discover_sources(callback: CallbackQuery, user: User | None, session: 
         logger.error(f"Error discovering sources: {e}")
         await loading_msg.edit_text(
             "❌ Ошибка при поиске источников. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_to_menu_new_keyboard(),
         )
 
 
@@ -223,6 +217,9 @@ async def add_discovered_source(
     if src_type == "telegram":
         identifier = f"@{title.lstrip('@')}"
         source = await get_or_create_source(session, "telegram", identifier, title=src.get("snippet", identifier))
+    elif src_type in {"reddit", "github", "producthunt"}:
+        identifier = src.get("identifier") or src.get("url") or title
+        source = await get_or_create_source(session, src_type, identifier, title=title)
     else:
         source = await get_or_create_source(session, "web", src["url"], title=title)
 
@@ -248,12 +245,6 @@ async def search_alert_sources(callback: CallbackQuery, user: User | None, sessi
 
     await callback.answer("🔍 Ищу источники...")
 
-    # Keep alert message, remove button
-    try:
-        await callback.message.edit_reply_markup(reply_markup=back_to_menu_keyboard())
-    except Exception:
-        pass
-
     loading_msg = await callback.message.answer("🔍 Ищу источники и информацию по теме алерта...")
 
     try:
@@ -277,16 +268,16 @@ async def search_alert_sources(callback: CallbackQuery, user: User | None, sessi
         if not discovered:
             await loading_msg.edit_text(
                 "🤷 Не удалось найти дополнительные источники по этой теме.",
-                reply_markup=back_to_menu_keyboard(),
+                reply_markup=back_to_menu_new_keyboard(),
             )
             return
 
         await state.update_data(discovered_sources=discovered)
 
         tg_count = sum(1 for r in discovered if r.get("type") == "telegram")
-        web_count = sum(1 for r in discovered if r.get("type") == "web")
+        non_tg_count = len(discovered) - tg_count
         text = f'🔍 <b>Найдено {len(discovered)} источников по теме алерта</b> '
-        text += f'(📡 {tg_count} каналов, 🔗 {web_count} сайтов)\n\n'
+        text += f'(📡 {tg_count} каналов, 🔗 {non_tg_count} API/Web)\n\n'
         for i, src in enumerate(discovered):
             emoji = "📡" if src.get("type") == "telegram" else "🔗"
             snippet = src["snippet"][:100] + "..." if len(src["snippet"]) > 100 else src["snippet"]
@@ -313,5 +304,5 @@ async def search_alert_sources(callback: CallbackQuery, user: User | None, sessi
         logger.error(f"Error searching alert sources: {e}")
         await loading_msg.edit_text(
             "❌ Ошибка при поиске. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_to_menu_new_keyboard(),
         )

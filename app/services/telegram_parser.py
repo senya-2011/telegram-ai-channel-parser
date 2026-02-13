@@ -6,7 +6,7 @@ from telethon.tl.functions.messages import GetMessagesReactionsRequest
 
 from app.config import settings
 from app.db.database import async_session
-from app.db.repositories import create_post, get_all_sources
+from app.db.repositories import create_post, get_all_sources, get_existing_external_ids
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,8 @@ async def _parse_single_channel(
 
     messages = await client.get_messages(entity, limit=limit)
     new_count = 0
+    external_ids = [str(msg.id) for msg in messages if msg.text and len(msg.text.strip()) >= 30]
+    existing_ids = await get_existing_external_ids(session, source_id=source_id, external_ids=external_ids)
 
     for msg in messages:
         if not msg.text or len(msg.text.strip()) < 30:
@@ -91,6 +93,8 @@ async def _parse_single_channel(
             continue
 
         external_id = str(msg.id)
+        if external_id in existing_ids:
+            continue
         reactions_count = _count_reactions(msg)
 
         published_at = msg.date
@@ -104,6 +108,7 @@ async def _parse_single_channel(
             content=msg.text,
             reactions_count=reactions_count,
             published_at=published_at,
+            commit=False,
         )
 
         if post:
@@ -111,6 +116,7 @@ async def _parse_single_channel(
             logger.debug(f"New post from @{channel_username}: {msg.text[:60]}...")
 
     if new_count > 0:
+        await session.commit()
         logger.info(f"Parsed {new_count} new posts from @{channel_username}")
     else:
         logger.debug(f"No new posts from @{channel_username}")

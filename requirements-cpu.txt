@@ -1,0 +1,38 @@
+# Use this on a server WITHOUT GPU to avoid downloading ~2.5GB of CUDA packages.
+# Install in two steps so PyTorch is taken from CPU index (smaller, no nvidia-* deps).
+#
+# Step 1: PyTorch CPU-only (~200MB instead of ~2.5GB)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Step 2: rest of dependencies (same as requirements.txt)
+# Telegram Bot
+aiogram==3.15.0
+# Telegram Client (channel parsing)
+telethon==1.37.0
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.1
+pgvector==0.3.6
+# LLM
+openai==1.59.7
+# Embeddings (will use already installed CPU torch)
+sentence-transformers==3.3.1
+# Web parsing
+httpx==0.28.1
+feedparser==6.0.11
+beautifulsoup4==4.12.3
+lxml==5.3.0
+# Scheduling
+apscheduler==3.10.4
+# Auth
+bcrypt==4.2.1
+# Config
+pydantic-settings==2.7.1
+# Web search
+tavily-python==0.7.21
+# Misc
+python-dotenv==1.0.1
+pytz==2024.2
+numpy==1.26.4

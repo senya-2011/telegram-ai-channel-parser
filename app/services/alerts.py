@@ -1,137 +1,117 @@
+import hashlib
 import logging
+import re
 
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import Post
+from app.db.models import NewsCluster, Post
 from app.db.repositories import (
+    attach_post_to_cluster,
     create_alert,
+    create_news_cluster,
+    find_similar_clusters,
     get_avg_reactions_for_source,
+    get_cluster_by_id,
+    get_pending_clusters_for_alerts,
+    get_posts_for_cluster,
+    get_recent_post_by_hash,
     get_source_by_id,
+    get_sources_by_ids,
     get_subscribers_for_source,
+    get_subscribers_for_sources,
     get_telegram_ids_for_user,
     get_unprocessed_posts,
-    update_post_analysis,
+    get_clusters_for_popularity_updates,
+    mark_cluster_popularity_notified,
+    mark_cluster_alert_sent,
 )
-from app.services.embedding import generate_embedding
-from app.services.llm_client import check_ai_relevance, summarize_post
-from app.services.similarity import find_confirmed_similar_posts
+from app.services.embedding import cosine_similarity, generate_embedding
+from app.services.llm_client import analyze_post, check_similarity
 
 logger = logging.getLogger(__name__)
 
-# Keywords to filter Tavily results — only AI-related content passes
-_AI_KEYWORDS = {
-    "ai", "artificial intelligence", "ml", "machine learning", "deep learning",
-    "neural network", "neural net", "llm", "gpt", "chatgpt", "openai", "deepseek",
-    "gemini", "claude", "transformer", "diffusion", "генеративн", "нейросет",
-    "нейронн", "искусственн интеллект", "машинн обучен", "ии ", "ии-",
-    "language model", "computer vision", "nlp", "rag", "fine-tun", "embedding",
-    "автоматизац", "робот", "copilot", "midjourney", "stable diffusion", "hugging face",
-}
+_NOISE_PATTERNS = (
+    r"https?://\S+",
+    r"@\w+",
+    r"#\w+",
+    r"[^\w\s]",
+)
+
+_AI_PREFILTER = (
+    "ai", "ml", "llm", "gpt", "openai", "deepseek", "anthropic", "gemini", "claude",
+    "нейросет", "искусствен", "машинн обучен", "ии", "модель", "агент",
+)
 
 
-def _is_ai_related(text: str) -> bool:
-    """Check if text contains AI-related keywords."""
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in _AI_KEYWORDS)
+def _normalize_text(text: str) -> str:
+    cleaned = text.lower()
+    for pattern in _NOISE_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:4000]
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _escape_md_url(url: str) -> str:
-    """Escape parentheses in URLs so Markdown links don't break."""
     return url.replace("(", "%28").replace(")", "%29")
 
 
+def _extract_first_url(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"https?://\S+", text)
+    return match.group(0).rstrip(").,]") if match else ""
+
+
+def _soft_limit(text: str, max_len: int = 420) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rsplit(" ", 1)[0].strip()
+    return (cut or text[:max_len]).rstrip(".,;:") + "..."
+
+
 def _get_post_link(source, post) -> str:
-    """Generate a link to the original post/article."""
     if source and source.type == "telegram":
         channel = source.identifier.lstrip("@")
         return f"https://t.me/{channel}/{post.external_id}"
-    elif post.external_id and post.external_id.startswith("http"):
+    if post.external_id and post.external_id.startswith("http"):
         return _escape_md_url(post.external_id)
     return ""
 
 
-async def process_new_posts(session: AsyncSession, bot: Bot):
-    """
-    Main processing pipeline for new posts:
-    1. Analyze all posts (summary, embedding, relevance)
-    2. Group similar posts into clusters — one alert per cluster
-    3. Check for reaction anomalies
-    """
-    unprocessed = await get_unprocessed_posts(session, limit=30)
+def _quick_prefilter(text: str) -> bool:
+    text_lower = text.lower()
+    return any(token in text_lower for token in _AI_PREFILTER)
 
+
+async def process_new_posts(session: AsyncSession, bot: Bot):
+    unprocessed = await get_unprocessed_posts(session, limit=40)
     if not unprocessed:
         logger.debug("No unprocessed posts found")
         return
 
     logger.info(f"Processing {len(unprocessed)} new posts...")
-
-    # Phase 1: Analyze all posts (summary, embedding, AI relevance)
     relevant_posts: list[Post] = []
+    avg_reactions_cache: dict[int, float] = {}
+
     for post in unprocessed:
         try:
-            is_relevant = await _analyze_post(session, post)
+            is_relevant = await _analyze_and_cluster_post(session, post, avg_reactions_cache)
             if is_relevant:
                 relevant_posts.append(post)
         except Exception as e:
             logger.error(f"Error analyzing post {post.id}: {e}")
 
-    if not relevant_posts:
-        return
+    await _send_cluster_alerts(session, bot)
+    await _send_cluster_popularity_updates(session, bot)
 
-    # Phase 2: Group similar posts into clusters, send ONE alert per cluster
-    alerted_post_ids: set[int] = set()  # track which posts already got a similarity alert
-
-    for post in relevant_posts:
-        if post.id in alerted_post_ids:
-            continue  # already included in a cluster alert
-
-        if post.embedding is None:
-            continue
-
-        try:
-            similar_posts = await find_confirmed_similar_posts(session, post)
-            if not similar_posts:
-                continue
-
-            # Collect all posts from this batch that are also similar to this one
-            # This merges e.g. post A, B, C about the same news into one alert
-            cluster_similar = list(similar_posts)
-            cluster_post_ids = {post.id} | {sp["post"].id for sp in similar_posts}
-
-            # Check if any other unprocessed post in this batch is also similar
-            for other_post in relevant_posts:
-                if other_post.id in cluster_post_ids:
-                    continue
-                if other_post.embedding is None or not other_post.summary:
-                    continue
-                # Check if this other post is similar to any post in the cluster
-                from app.services.embedding import cosine_similarity
-                embedding_list = list(post.embedding) if not isinstance(post.embedding, list) else post.embedding
-                other_emb = list(other_post.embedding) if not isinstance(other_post.embedding, list) else other_post.embedding
-                sim = cosine_similarity(embedding_list, other_emb)
-                if sim >= settings.similarity_threshold:
-                    source = await get_source_by_id(session, other_post.source_id)
-                    source_title = source.title or source.identifier if source else "Неизвестный"
-                    cluster_similar.append({
-                        "post": other_post,
-                        "source_title": source_title,
-                        "explanation": "",
-                        "similarity_score": sim,
-                    })
-                    cluster_post_ids.add(other_post.id)
-
-            # Mark all posts in this cluster as alerted
-            alerted_post_ids.update(cluster_post_ids)
-
-            # Send ONE consolidated alert for the whole cluster
-            await _send_similarity_alert(session, bot, post, cluster_similar)
-
-        except Exception as e:
-            logger.error(f"Error checking similarity for post {post.id}: {e}")
-
-    # Phase 3: Check reaction anomalies (independent of similarity)
     for post in relevant_posts:
         try:
             if post.reactions_ratio and post.reactions_ratio >= settings.reactions_multiplier:
@@ -140,180 +120,333 @@ async def process_new_posts(session: AsyncSession, bot: Bot):
             logger.error(f"Error sending reaction alert for post {post.id}: {e}")
 
 
-async def _analyze_post(session: AsyncSession, post: Post) -> bool:
-    """
-    Analyze a single post: summary, AI relevance, embedding, reactions.
-    Returns True if post is AI-relevant and should be checked for alerts.
-    """
-    # Step 1: Generate summary
-    summary = await summarize_post(post.content)
-    if not summary:
-        summary = post.content[:300] + "..." if len(post.content) > 300 else post.content
+async def _analyze_and_cluster_post(
+    session: AsyncSession,
+    post: Post,
+    avg_reactions_cache: dict[int, float],
+) -> bool:
+    normalized = _normalize_text(post.content)
+    normalized_hash = _hash_text(normalized)
+    reactions_ratio = await _calc_reactions_ratio(session, post, avg_reactions_cache)
 
-    # Step 2: Check AI relevance — filter out ads, promos, off-topic
-    is_relevant = await check_ai_relevance(summary)
+    existing = await get_recent_post_by_hash(session, normalized_hash=normalized_hash, hours=96)
+    if existing:
+        post.summary = existing.summary
+        post.embedding = existing.embedding
+        post.is_ai_relevant = existing.is_ai_relevant
+        post.normalized_hash = normalized_hash
+        post.reactions_ratio = reactions_ratio
+        if existing.cluster_id:
+            cluster = await get_cluster_by_id(session, existing.cluster_id)
+            if cluster:
+                await attach_post_to_cluster(
+                    session,
+                    post=post,
+                    cluster=cluster,
+                    normalized_hash=normalized_hash,
+                    is_ai_relevant=bool(existing.is_ai_relevant),
+                    commit=False,
+                )
+        await session.commit()
+        return bool(post.is_ai_relevant)
 
-    # Step 3: Generate embedding
-    text_for_embedding = summary or post.content
-    embedding = generate_embedding(text_for_embedding)
+    if not _quick_prefilter(post.content):
+        post.summary = post.content[:240] + "..." if len(post.content) > 240 else post.content
+        post.normalized_hash = normalized_hash
+        post.is_ai_relevant = False
+        post.reactions_ratio = reactions_ratio
+        await session.commit()
+        return False
 
-    # Step 4: Check reaction anomaly ratio
-    reactions_ratio = None
-    if post.reactions_count > 0:
-        avg_reactions = await get_avg_reactions_for_source(session, post.source_id, days=7)
-        if avg_reactions > 0:
-            reactions_ratio = post.reactions_count / avg_reactions
+    analysis = await analyze_post(post.content)
+    summary = analysis["summary"]
+    is_relevant = bool(analysis["is_relevant"])
+    coreai_score = float(analysis.get("coreai_score", 0.0))
+    coreai_reason = analysis.get("coreai_reason", "")
+    tags = analysis.get("tags", [])
 
-    # Save analysis results (always, even if filtered)
-    await update_post_analysis(
-        session,
-        post_id=post.id,
-        summary=summary,
-        embedding=embedding,
-        reactions_ratio=reactions_ratio,
-    )
-
-    # Update post object in memory
     post.summary = summary
-    post.embedding = embedding
+    post.normalized_hash = normalized_hash
+    post.is_ai_relevant = is_relevant
     post.reactions_ratio = reactions_ratio
 
     if not is_relevant:
-        logger.info(f"Post {post.id} filtered out — not AI-relevant (ad/promo/off-topic)")
+        await session.commit()
         return False
 
+    embedding = generate_embedding(summary or post.content)
+    post.embedding = embedding
+
+    matched_cluster = await _match_cluster(session, summary=summary, embedding=embedding)
+    if matched_cluster:
+        await attach_post_to_cluster(
+            session,
+            post=post,
+            cluster=matched_cluster,
+            normalized_hash=normalized_hash,
+            is_ai_relevant=True,
+            tags=tags,
+            commit=False,
+        )
+        await session.commit()
+        return True
+
+    cluster = await create_news_cluster(
+        session=session,
+        canonical_hash=normalized_hash,
+        canonical_text=post.content[:4000],
+        canonical_summary=summary,
+        embedding=embedding,
+        source_id=post.source_id,
+        is_ai_relevant=True,
+        coreai_score=coreai_score,
+        coreai_reason=coreai_reason,
+        tags=tags,
+    )
+    post.cluster_id = cluster.id
+    await session.commit()
     return True
 
 
-async def _enrich_alert_with_search(summary: str) -> str:
-    """Search the web for additional context about the alert topic."""
-    try:
-        if not settings.tavily_api_key:
-            return ""
-        from tavily import AsyncTavilyClient
-        client = AsyncTavilyClient(api_key=settings.tavily_api_key)
-        response = await client.search(
-            query=summary[:200],
-            search_depth="basic",
-            max_results=3,
-            include_answer=True,
+async def _calc_reactions_ratio(
+    session: AsyncSession,
+    post: Post,
+    avg_reactions_cache: dict[int, float],
+) -> float | None:
+    if post.reactions_count <= 0:
+        return None
+    if post.source_id not in avg_reactions_cache:
+        avg_reactions_cache[post.source_id] = await get_avg_reactions_for_source(
+            session, post.source_id, days=7
         )
-        extra = ""
-        answer = response.get("answer")
-        if answer:
-            extra += f"\n\n🌐 <b>Что пишут другие источники:</b>\n{answer[:400]}\n"
-        results = response.get("results", [])[:6]  # fetch more, then filter
-        if results:
-            # Filter: only AI-related results
-            ai_results = [
-                r for r in results
-                if _is_ai_related(r.get("title", "") + " " + r.get("content", ""))
-            ][:3]
-            if ai_results:
-                extra += "\n📎 <b>Из других источников:</b>\n"
-                for r in ai_results:
-                    title = r.get("title", "")[:60]
-                    url = _escape_md_url(r.get("url", ""))
-                    snippet = r.get("content", "")[:120]
-                    if snippet:
-                        extra += f'• <a href="{url}">{title}</a>\n  <i>{snippet}</i>\n'
-                    else:
-                        extra += f'• <a href="{url}">{title}</a>\n'
-        return extra
-    except Exception as e:
-        logger.debug(f"Alert enrichment failed: {e}")
-        return ""
+    avg = avg_reactions_cache[post.source_id]
+    if avg <= 0:
+        return None
+    return post.reactions_count / avg
 
 
-async def _send_similarity_alert(
-    session: AsyncSession, bot: Bot, post: Post, similar_posts: list[dict]
-):
-    """Create and send alerts for similar posts across channels."""
-    source = await get_source_by_id(session, post.source_id)
-    source_title = source.title or source.identifier if source else "Неизвестный"
-    post_link = _get_post_link(source, post)
+async def _match_cluster(
+    session: AsyncSession,
+    summary: str,
+    embedding: list | None,
+) -> NewsCluster | None:
+    if embedding is None:
+        return None
+    candidates = await find_similar_clusters(
+        session,
+        embedding=embedding,
+        threshold=settings.similarity_threshold,
+        hours=96,
+        limit=5,
+    )
+    if not candidates:
+        return None
 
-    similar_sources = [s["source_title"] for s in similar_posts]
-    explanation = similar_posts[0]["explanation"] if similar_posts else ""
+    hard_threshold = min(0.97, settings.similarity_threshold + 0.06)
+    soft_threshold = settings.similarity_threshold
+    best_soft: NewsCluster | None = None
+    best_soft_sim = 0.0
 
-    # Build links for all similar posts (HTML format)
-    links_text = ""
-    if post_link:
-        links_text += f'🔗 <a href="{post_link}">{source_title}</a>\n'
-    for sp in similar_posts:
-        sp_source = await get_source_by_id(session, sp["post"].source_id)
-        sp_link = _get_post_link(sp_source, sp["post"])
-        if sp_link:
-            links_text += f'🔗 <a href="{sp_link}">{sp["source_title"]}</a>\n'
+    for candidate in candidates:
+        if candidate.embedding is None:
+            continue
+        sim = cosine_similarity(embedding, list(candidate.embedding))
+        if sim >= hard_threshold:
+            return candidate
+        if sim >= soft_threshold and sim > best_soft_sim:
+            best_soft = candidate
+            best_soft_sim = sim
 
-    # Enrich with web search
-    extra_context = await _enrich_alert_with_search(post.summary or post.content[:200])
+    if best_soft is None:
+        return None
+
+    result = await check_similarity(summary, best_soft.canonical_summary)
+    if result["is_similar"]:
+        return best_soft
+    return None
+
+
+async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
+    clusters = await get_pending_clusters_for_alerts(
+        session,
+        min_mentions=settings.cluster_min_mentions,
+        limit=20,
+    )
+    for cluster in clusters:
+        try:
+            await _send_similarity_alert_for_cluster(session, bot, cluster)
+            await mark_cluster_alert_sent(session, cluster.id)
+        except Exception as e:
+            logger.error(f"Error sending cluster alert {cluster.id}: {e}")
+
+
+async def _send_cluster_popularity_updates(session: AsyncSession, bot: Bot) -> None:
+    clusters = await get_clusters_for_popularity_updates(session, limit=20)
+    for cluster in clusters:
+        try:
+            await _send_cluster_popularity_message(session, bot, cluster)
+            await mark_cluster_popularity_notified(session, cluster.id, cluster.mention_count or 0)
+        except Exception as e:
+            logger.error(f"Error sending popularity update for cluster {cluster.id}: {e}")
+
+
+async def _send_cluster_popularity_message(
+    session: AsyncSession,
+    bot: Bot,
+    cluster: NewsCluster,
+) -> None:
+    posts = await get_posts_for_cluster(session, cluster.id, limit=30)
+    if not posts:
+        return
+
+    source_ids = sorted({p.source_id for p in posts})
+    sources_map = await get_sources_by_ids(session, source_ids)
+    subscribers_map = await get_subscribers_for_sources(session, source_ids)
+    representative_post = posts[0]
+
+    links_lines: list[str] = []
+    seen_sources: set[int] = set()
+    for post in posts:
+        if post.source_id in seen_sources:
+            continue
+        source = sources_map.get(post.source_id)
+        title = source.title or source.identifier if source else f"source:{post.source_id}"
+        post_link = _get_post_link(source, post)
+        if post_link:
+            links_lines.append(f'• <a href="{post_link}">{title}</a>')
+        else:
+            fallback_url = _extract_first_url(post.content or "")
+            if fallback_url:
+                links_lines.append(f'• <a href="{fallback_url}">{title}</a>')
+            else:
+                links_lines.append(f"• {title}")
+        seen_sources.add(post.source_id)
 
     reason = (
-        f"🔔 Похожая новость найдена в нескольких каналах!\n\n"
-        f"📰 <b>Новость:</b> {post.summary[:200]}\n\n"
-        f"📡 <b>Источники:</b> {source_title}, {', '.join(similar_sources)}\n\n"
-        f"{links_text}\n"
-        f"💡 <b>Анализ:</b> {explanation}"
-        f"{extra_context}"
+        "📈 <b>Обновление по новости:</b> тема набирает популярность\n\n"
+        f"📰 <b>Суть:</b> {cluster.canonical_summary[:220]}\n"
+        f"🏷 <b>Теги:</b> {' '.join(tag for tag in (cluster.tags or '').split(',') if tag) or '#AIТехнологии'}\n"
+        f"📡 <b>Уже источников:</b> {cluster.mention_count}\n"
+        f"🔁 <b>Рост:</b> новость продолжает появляться в новых каналах/сайтах\n\n"
+        f"{chr(10).join(links_lines)}"
     )
 
-    # Get all subscribers for this source
-    subscribers = await get_subscribers_for_source(session, post.source_id)
-
-    # Also get subscribers of similar posts' sources
+    topic = cluster.canonical_summary[:100]
+    users = []
     seen_user_ids = set()
-    for sub in subscribers:
-        seen_user_ids.add(sub.id)
+    for source_id in source_ids:
+        for user in subscribers_map.get(source_id, []):
+            if user.id in seen_user_ids:
+                continue
+            seen_user_ids.add(user.id)
+            users.append(user)
 
-    for sim_post in similar_posts:
-        sim_subscribers = await get_subscribers_for_source(session, sim_post["post"].source_id)
-        for sub in sim_subscribers:
-            if sub.id not in seen_user_ids:
-                subscribers.append(sub)
-                seen_user_ids.add(sub.id)
+    for user in users:
+        await create_alert(session, user.id, representative_post.id, "trend", reason)
+        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
 
-    alert_topic = post.summary[:100] if post.summary else post.content[:100]
-    for user in subscribers:
-        alert = await create_alert(session, user.id, post.id, "similar", reason)
-        await _send_alert_to_user(bot, session, user.id, reason, topic=alert_topic)
+
+async def _send_similarity_alert_for_cluster(
+    session: AsyncSession,
+    bot: Bot,
+    cluster: NewsCluster,
+) -> None:
+    posts = await get_posts_for_cluster(session, cluster.id, limit=30)
+    if not posts:
+        return
+
+    source_ids = sorted({p.source_id for p in posts})
+    sources_map = await get_sources_by_ids(session, source_ids)
+    subscribers_map = await get_subscribers_for_sources(session, source_ids)
+
+    seen_sources: set[int] = set()
+    links_lines: list[str] = []
+    source_titles: list[str] = []
+    representative_post = posts[0]
+
+    for post in posts:
+        if post.source_id in seen_sources:
+            continue
+        source = sources_map.get(post.source_id)
+        title = source.title or source.identifier if source else f"source:{post.source_id}"
+        source_titles.append(title)
+        post_link = _get_post_link(source, post)
+        if post_link:
+            links_lines.append(f'🔗 <a href="{post_link}">{title}</a>')
+        else:
+            fallback_url = _extract_first_url(post.content or "")
+            if fallback_url:
+                links_lines.append(f'🔗 <a href="{fallback_url}">{title}</a>')
+            else:
+                links_lines.append(f"🔗 {title}")
+        seen_sources.add(post.source_id)
+
+    topic = cluster.canonical_summary[:120]
+    coreai_line = ""
+    if cluster.coreai_score >= settings.coreai_alert_threshold:
+        core_reason = _soft_limit(cluster.coreai_reason, max_len=420)
+        coreai_line = f"\n🏷 <b>CoreAI:</b> {cluster.coreai_score:.2f} - {core_reason}\n"
+    tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) or "#AIТехнологии"
+
+    reason = (
+        "🔔 Похожая новость подтверждена в нескольких источниках\n\n"
+        f"📰 <b>Суть:</b> {cluster.canonical_summary[:260]}\n"
+        f"🏷 <b>Теги:</b> {tags_text}\n"
+        f"📡 <b>Источников:</b> {cluster.mention_count}\n"
+        f"{coreai_line}"
+        f"\n{chr(10).join(links_lines)}"
+    )
+
+    all_users = []
+    seen_user_ids = set()
+    for source_id in source_ids:
+        for user in subscribers_map.get(source_id, []):
+            if user.id in seen_user_ids:
+                continue
+            seen_user_ids.add(user.id)
+            all_users.append(user)
+
+    for user in all_users:
+        await create_alert(session, user.id, representative_post.id, "similar", reason)
+        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
 
 
 async def _send_reactions_alert(
-    session: AsyncSession, bot: Bot, post: Post, reactions_ratio: float
+    session: AsyncSession,
+    bot: Bot,
+    post: Post,
+    reactions_ratio: float,
 ):
-    """Create and send alerts for posts with abnormally high reactions."""
     source = await get_source_by_id(session, post.source_id)
     source_title = source.title or source.identifier if source else "Неизвестный"
     post_link = _get_post_link(source, post)
     link_text = f'\n🔗 <a href="{post_link}">Открыть оригинал</a>' if post_link else ""
-
-    # Enrich with web search
-    extra_context = await _enrich_alert_with_search(post.summary or post.content[:200])
+    tags_text = "#AIТехнологии"
+    if post.cluster_id:
+        cluster = await get_cluster_by_id(session, post.cluster_id)
+        if cluster and cluster.tags:
+            tags_text = " ".join(tag for tag in cluster.tags.split(",") if tag)
 
     reason = (
-        f"🔥 Пост с аномально высокой активностью!\n\n"
-        f"📰 <b>Новость:</b> {post.summary[:200]}\n\n"
+        "🔥 Пост с аномально высокой активностью\n\n"
+        f"📰 <b>Новость:</b> {(post.summary or post.content)[:220]}\n\n"
+        f"🏷 <b>Теги:</b> {tags_text}\n"
         f"📡 <b>Канал:</b> {source_title}\n"
         f"👍 <b>Реакций:</b> {post.reactions_count} "
-        f"(в {reactions_ratio:.1f}x раз больше среднего)\n\n"
-        f"💡 Этот пост вызвал значительно больше реакций, чем обычные посты в этом канале."
-        f"{link_text}"
-        f"{extra_context}"
+        f"(в {reactions_ratio:.1f}x выше среднего){link_text}"
     )
 
-    alert_topic = post.summary[:100] if post.summary else post.content[:100]
+    topic = (post.summary or post.content)[:100]
     subscribers = await get_subscribers_for_source(session, post.source_id)
     for user in subscribers:
-        alert = await create_alert(session, user.id, post.id, "reactions", reason)
-        await _send_alert_to_user(bot, session, user.id, reason, topic=alert_topic)
+        await create_alert(session, user.id, post.id, "reactions", reason)
+        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
 
 
 async def _send_alert_to_user(bot: Bot, session: AsyncSession, user_id: int, text: str, topic: str = ""):
-    """Send alert message to all Telegram accounts linked to the user."""
     from app.bot.keyboards import alert_keyboard
-    keyboard = alert_keyboard(topic) if topic else None
 
+    keyboard = alert_keyboard(topic) if topic else None
     telegram_ids = await get_telegram_ids_for_user(session, user_id)
     for tg_id in telegram_ids:
         try:

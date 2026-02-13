@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import auth_keyboard, main_menu_keyboard
-from app.db.models import Alert, Post, Source, User, UserSource
+from app.db.models import Alert, Post, User, UserSource
 
 router = Router()
 
@@ -33,6 +33,8 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
     total_posts = 0
     posts_24h = 0
     processed_posts = 0
+    total_clusters = 0
+    clusters_24h = 0
     if source_ids:
         import datetime
         cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
@@ -56,6 +58,22 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
         )
         processed_posts = r3.scalar() or 0
 
+        r4 = await session.execute(
+            select(func.count(func.distinct(Post.cluster_id))).select_from(Post).where(
+                Post.source_id.in_(source_ids), Post.cluster_id.isnot(None)
+            )
+        )
+        total_clusters = r4.scalar() or 0
+
+        r5 = await session.execute(
+            select(func.count(func.distinct(Post.cluster_id))).select_from(Post).where(
+                Post.source_id.in_(source_ids),
+                Post.cluster_id.isnot(None),
+                Post.parsed_at >= cutoff,
+            )
+        )
+        clusters_24h = r5.scalar() or 0
+
     # Alerts for this user
     alerts_count = await session.execute(
         select(func.count()).select_from(Alert).where(Alert.user_id == user.id)
@@ -67,10 +85,12 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
         f"📡 Ваших источников: **{total_sources}**\n"
         f"📝 Постов всего: **{total_posts}**\n"
         f"🕐 Постов за 24ч: **{posts_24h}**\n"
-        f"🤖 Обработано (summary): **{processed_posts}**\n"
+        f"🤖 Обработано постов: **{processed_posts}**\n"
+        f"🧩 Кластеров новостей всего: **{total_clusters}**\n"
+        f"🕐 Кластеров за 24ч: **{clusters_24h}**\n"
         f"🔔 Ваших алертов: **{total_alerts}**\n\n"
         f"_Парсинг каналов: каждые 10 мин_\n"
-        f"_Парсинг ссылок: каждые 30 мин_",
+        f"_Парсинг ссылок/API: каждые 30 мин_",
         parse_mode="Markdown",
     )
 
@@ -113,6 +133,21 @@ async def show_main_menu(callback: CallbackQuery, user: User | None, state: FSMC
         return
 
     await callback.message.edit_text(
+        f"📋 **Главное меню**\n\nПривет, {user.username}! Выберите действие:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:new")
+async def show_main_menu_new_message(callback: CallbackQuery, user: User | None, state: FSMContext):
+    await state.clear()
+    if not user:
+        await callback.answer("Сначала авторизуйтесь.", show_alert=True)
+        return
+
+    await callback.message.answer(
         f"📋 **Главное меню**\n\nПривет, {user.username}! Выберите действие:",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",

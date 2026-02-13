@@ -15,6 +15,15 @@ from app.db.repositories import (
 
 router = Router()
 
+_LINK_SOURCE_TYPES = ("web", "reddit", "github", "producthunt")
+
+
+async def _get_link_like_sources(session: AsyncSession, user_id: int):
+    collected = []
+    for source_type in _LINK_SOURCE_TYPES:
+        collected.extend(await get_user_sources(session, user_id, source_type=source_type))
+    return collected
+
 
 @router.callback_query(F.data == "menu:links")
 async def show_links(callback: CallbackQuery, user: User | None, session: AsyncSession):
@@ -22,7 +31,7 @@ async def show_links(callback: CallbackQuery, user: User | None, session: AsyncS
         await callback.answer("Сначала авторизуйтесь.", show_alert=True)
         return
 
-    links = await get_user_sources(session, user.id, source_type="web")
+    links = await _get_link_like_sources(session, user.id)
     if links:
         text = "🔗 **Ваши веб-ссылки:**\n\nНажмите ❌ чтобы отписаться:"
     else:
@@ -104,7 +113,7 @@ async def unsubscribe_link(callback: CallbackQuery, user: User | None, session: 
         await callback.answer("Ссылка не найдена.")
 
     # Refresh list
-    links = await get_user_sources(session, user.id, source_type="web")
+    links = await _get_link_like_sources(session, user.id)
     if links:
         text = "🔗 **Ваши веб-ссылки:**\n\nНажмите ❌ чтобы отписаться:"
     else:

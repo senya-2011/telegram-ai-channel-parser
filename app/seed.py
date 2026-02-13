@@ -32,6 +32,35 @@ DEFAULT_WEB_SOURCES = [
     ("https://huggingface.co/blog", "Hugging Face Blog"),
 ]
 
+# Default API sources — AI-focused feeds with strong signal
+DEFAULT_REDDIT_SOURCES = [
+    ("MachineLearning", "Reddit r/MachineLearning"),
+    ("LocalLLaMA", "Reddit r/LocalLLaMA"),
+    ("artificial", "Reddit r/artificial"),
+    ("OpenAI", "Reddit r/OpenAI"),
+    ("ChatGPT", "Reddit r/ChatGPT"),
+    ("singularity", "Reddit r/singularity"),
+    ("StableDiffusion", "Reddit r/StableDiffusion"),
+]
+
+DEFAULT_GITHUB_SOURCES = [
+    ("openai/openai-python", "GitHub OpenAI Python"),
+    ("huggingface/transformers", "GitHub Hugging Face Transformers"),
+    ("langchain-ai/langchain", "GitHub LangChain"),
+    ("openai/openai-cookbook", "GitHub OpenAI Cookbook"),
+    ("vllm-project/vllm", "GitHub vLLM"),
+    ("ollama/ollama", "GitHub Ollama"),
+    ("microsoft/autogen", "GitHub AutoGen"),
+    ("crewAIInc/crewAI", "GitHub CrewAI"),
+]
+
+DEFAULT_PRODUCTHUNT_SOURCES = [
+    ("ai", "Product Hunt — AI"),
+    ("llm", "Product Hunt — LLM"),
+    ("automation", "Product Hunt — Automation"),
+    ("developer", "Product Hunt — Developer Tools"),
+]
+
 
 async def seed_defaults():
     """Create default sources in the database."""
@@ -57,6 +86,36 @@ async def seed_defaults():
                 is_default=True,
             )
             logger.info(f"  [web] {url} -> id={source.id}")
+
+        for identifier, title in DEFAULT_REDDIT_SOURCES:
+            source = await get_or_create_source(
+                session,
+                source_type="reddit",
+                identifier=identifier,
+                title=title,
+                is_default=True,
+            )
+            logger.info(f"  [reddit] {identifier} -> id={source.id}")
+
+        for identifier, title in DEFAULT_GITHUB_SOURCES:
+            source = await get_or_create_source(
+                session,
+                source_type="github",
+                identifier=identifier,
+                title=title,
+                is_default=True,
+            )
+            logger.info(f"  [github] {identifier} -> id={source.id}")
+
+        for identifier, title in DEFAULT_PRODUCTHUNT_SOURCES:
+            source = await get_or_create_source(
+                session,
+                source_type="producthunt",
+                identifier=identifier,
+                title=title,
+                is_default=True,
+            )
+            logger.info(f"  [producthunt] {identifier} -> id={source.id}")
 
     logger.info("Seeding complete!")
 

@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,6 +10,7 @@ from app.config import settings
 from app.db.database import async_session
 from app.db.repositories import get_all_users_with_settings, get_telegram_ids_for_user, get_user_settings
 from app.services.alerts import process_new_posts
+from app.services.api_sources_parser import parse_api_sources
 from app.services.digest import generate_digest_for_user
 from app.services.telegram_parser import parse_telegram_channels
 from app.services.web_parser import parse_web_sources
@@ -39,6 +41,10 @@ async def task_parse_web(bot: Bot):
         await parse_web_sources()
     except Exception as e:
         logger.error(f"[Scheduler] Web parsing error: {e}")
+    try:
+        await parse_api_sources()
+    except Exception as e:
+        logger.error(f"[Scheduler] API sources parsing error: {e}")
 
     # Process new posts
     try:
@@ -147,6 +153,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="parse_telegram",
         name="Parse Telegram Channels",
         replace_existing=True,
+        next_run_time=datetime.utcnow(),
     )
 
     # Parse web sources every N minutes
@@ -157,6 +164,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="parse_web",
         name="Parse Web Sources",
         replace_existing=True,
+        next_run_time=datetime.utcnow(),
     )
 
     # Check digest schedule every minute
