@@ -15,6 +15,7 @@ from app.db.repositories import (
     get_avg_reactions_for_source,
     get_cluster_by_id,
     get_pending_clusters_for_alerts,
+    get_pending_important_clusters_for_alerts,
     get_posts_for_cluster,
     get_recent_post_by_hash,
     get_source_by_id,
@@ -91,6 +92,11 @@ def _quick_prefilter(text: str) -> bool:
     return any(token in text_lower for token in _AI_PREFILTER)
 
 
+def _priority_rank(priority: str) -> int:
+    mapping = {"low": 1, "medium": 2, "high": 3}
+    return mapping.get((priority or "low").lower(), 1)
+
+
 async def process_new_posts(session: AsyncSession, bot: Bot):
     unprocessed = await get_unprocessed_posts(session, limit=40)
     if not unprocessed:
@@ -164,6 +170,10 @@ async def _analyze_and_cluster_post(
     coreai_score = float(analysis.get("coreai_score", 0.0))
     coreai_reason = analysis.get("coreai_reason", "")
     tags = analysis.get("tags", [])
+    news_kind = analysis.get("news_kind", "misc")
+    product_score = float(analysis.get("product_score", 0.0))
+    priority = analysis.get("priority", "low")
+    is_alert_worthy = bool(analysis.get("is_alert_worthy", False))
 
     post.summary = summary
     post.normalized_hash = normalized_hash
@@ -186,6 +196,10 @@ async def _analyze_and_cluster_post(
             normalized_hash=normalized_hash,
             is_ai_relevant=True,
             tags=tags,
+            news_kind=news_kind,
+            product_score=product_score,
+            priority=priority,
+            is_alert_worthy=is_alert_worthy,
             commit=False,
         )
         await session.commit()
@@ -202,6 +216,10 @@ async def _analyze_and_cluster_post(
         coreai_score=coreai_score,
         coreai_reason=coreai_reason,
         tags=tags,
+        news_kind=news_kind,
+        product_score=product_score,
+        priority=priority,
+        is_alert_worthy=is_alert_worthy,
     )
     post.cluster_id = cluster.id
     await session.commit()
@@ -267,14 +285,71 @@ async def _match_cluster(
 
 
 async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
-    clusters = await get_pending_clusters_for_alerts(
+    pending = list(await get_pending_clusters_for_alerts(
         session,
         min_mentions=settings.cluster_min_mentions,
         limit=20,
+    ))
+    if not pending:
+        return
+
+    products = [
+        c for c in pending
+        if c.news_kind == "product"
+        and c.product_score >= settings.min_product_score_for_alert
+        and (c.is_alert_worthy or c.priority in {"high", "medium"})
+    ]
+    products.sort(key=lambda c: (_priority_rank(c.priority), c.product_score, c.mention_count), reverse=True)
+
+    trends = [
+        c for c in pending
+        if c.news_kind == "trend"
+        and c.coreai_score >= settings.min_non_product_core_score_for_alert
+        and c.is_alert_worthy
+    ]
+    trends.sort(key=lambda c: (c.coreai_score, c.mention_count), reverse=True)
+
+    research = [
+        c for c in pending
+        if c.news_kind == "research"
+        and c.coreai_score >= (settings.min_non_product_core_score_for_alert + 0.05)
+        and c.is_alert_worthy
+    ]
+    research.sort(key=lambda c: (c.coreai_score, c.mention_count), reverse=True)
+
+    selected = products[:20]
+    selected.extend(trends[: settings.trend_alerts_per_cycle])
+    selected.extend(research[: settings.research_alerts_per_cycle])
+
+    important = list(
+        await get_pending_important_clusters_for_alerts(
+            session,
+            min_core_score=settings.important_alert_core_score,
+            min_product_score=settings.important_alert_product_score,
+            limit=settings.important_alerts_per_cycle * 3,
+        )
     )
-    for cluster in clusters:
+    important.sort(key=lambda c: (c.coreai_score, c.product_score, _priority_rank(c.priority)), reverse=True)
+    selected.extend(important[: settings.important_alerts_per_cycle])
+    seen_ids = set()
+    filtered = []
+    for cluster in selected:
+        if cluster.id in seen_ids:
+            continue
+        seen_ids.add(cluster.id)
+        filtered.append(cluster)
+
+    for cluster in filtered:
         try:
-            await _send_similarity_alert_for_cluster(session, bot, cluster)
+            alert_type = "important" if (
+                cluster.coreai_score >= settings.important_alert_core_score
+                or (
+                    cluster.news_kind == "product"
+                    and cluster.product_score >= settings.important_alert_product_score
+                    and cluster.priority in {"high", "medium"}
+                )
+            ) else "similar"
+            await _send_similarity_alert_for_cluster(session, bot, cluster, alert_type=alert_type)
             await mark_cluster_alert_sent(session, cluster.id)
         except Exception as e:
             logger.error(f"Error sending cluster alert {cluster.id}: {e}")
@@ -350,6 +425,7 @@ async def _send_similarity_alert_for_cluster(
     session: AsyncSession,
     bot: Bot,
     cluster: NewsCluster,
+    alert_type: str = "similar",
 ) -> None:
     posts = await get_posts_for_cluster(session, cluster.id, limit=30)
     if not posts:
@@ -388,9 +464,11 @@ async def _send_similarity_alert_for_cluster(
         coreai_line = f"\n🏷 <b>CoreAI:</b> {cluster.coreai_score:.2f} - {core_reason}\n"
     tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) or "#AIТехнологии"
 
+    header = "🚨 <b>Важная новость:</b> высокий приоритет от CoreAI" if alert_type == "important" else "🔔 Похожая новость подтверждена в нескольких источниках"
     reason = (
-        "🔔 Похожая новость подтверждена в нескольких источниках\n\n"
+        f"{header}\n\n"
         f"📰 <b>Суть:</b> {cluster.canonical_summary[:260]}\n"
+        f"🧭 <b>Тип:</b> {cluster.news_kind} | priority: {cluster.priority}\n"
         f"🏷 <b>Теги:</b> {tags_text}\n"
         f"📡 <b>Источников:</b> {cluster.mention_count}\n"
         f"{coreai_line}"
@@ -407,7 +485,7 @@ async def _send_similarity_alert_for_cluster(
             all_users.append(user)
 
     for user in all_users:
-        await create_alert(session, user.id, representative_post.id, "similar", reason)
+        await create_alert(session, user.id, representative_post.id, alert_type, reason)
         await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
 
 

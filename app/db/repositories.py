@@ -339,6 +339,11 @@ def _merge_tags(existing: str, incoming: list[str] | None) -> str:
     return ",".join(sorted(tags))
 
 
+def _priority_rank(priority: str) -> int:
+    mapping = {"low": 1, "medium": 2, "high": 3}
+    return mapping.get((priority or "low").lower(), 1)
+
+
 async def get_cluster_by_hash(session: AsyncSession, canonical_hash: str) -> Optional[NewsCluster]:
     result = await session.execute(
         select(NewsCluster).where(NewsCluster.canonical_hash == canonical_hash)
@@ -362,6 +367,10 @@ async def create_news_cluster(
     coreai_score: float = 0.0,
     coreai_reason: str = "",
     tags: list[str] | None = None,
+    news_kind: str = "misc",
+    product_score: float = 0.0,
+    priority: str = "low",
+    is_alert_worthy: bool = False,
 ) -> NewsCluster:
     cluster = NewsCluster(
         canonical_hash=canonical_hash,
@@ -374,6 +383,10 @@ async def create_news_cluster(
         coreai_score=coreai_score,
         coreai_reason=coreai_reason,
         tags=_merge_tags("", tags),
+        news_kind=news_kind,
+        product_score=product_score,
+        priority=priority,
+        is_alert_worthy=is_alert_worthy,
     )
     session.add(cluster)
     try:
@@ -394,6 +407,10 @@ async def attach_post_to_cluster(
     normalized_hash: Optional[str] = None,
     is_ai_relevant: Optional[bool] = None,
     tags: list[str] | None = None,
+    news_kind: Optional[str] = None,
+    product_score: Optional[float] = None,
+    priority: Optional[str] = None,
+    is_alert_worthy: Optional[bool] = None,
     commit: bool = True,
 ) -> None:
     post.cluster_id = cluster.id
@@ -408,6 +425,15 @@ async def attach_post_to_cluster(
     cluster.mention_count = (cluster.mention_count or 0) + 1
     cluster.source_ids = _merge_source_ids(cluster.source_ids or "", post.source_id)
     cluster.tags = _merge_tags(cluster.tags or "", tags)
+    if product_score is not None:
+        cluster.product_score = max(float(cluster.product_score or 0.0), float(product_score))
+    if news_kind:
+        if cluster.news_kind != "product" or news_kind == "product":
+            cluster.news_kind = news_kind
+    if priority and _priority_rank(priority) > _priority_rank(cluster.priority):
+        cluster.priority = priority
+    if is_alert_worthy is not None:
+        cluster.is_alert_worthy = bool(cluster.is_alert_worthy or is_alert_worthy)
     cluster.updated_at = datetime.datetime.utcnow()
     if commit:
         await session.commit()
@@ -447,6 +473,33 @@ async def get_pending_clusters_for_alerts(
             NewsCluster.alert_sent_at.is_(None),
         )
         .order_by(NewsCluster.updated_at.asc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def get_pending_important_clusters_for_alerts(
+    session: AsyncSession,
+    min_core_score: float,
+    min_product_score: float,
+    limit: int = 20,
+) -> Sequence[NewsCluster]:
+    result = await session.execute(
+        select(NewsCluster)
+        .where(
+            NewsCluster.is_ai_relevant == True,
+            NewsCluster.alert_sent_at.is_(None),
+            NewsCluster.is_alert_worthy == True,
+            (
+                (NewsCluster.coreai_score >= min_core_score)
+                | (
+                    (NewsCluster.news_kind == "product")
+                    & (NewsCluster.product_score >= min_product_score)
+                    & (NewsCluster.priority.in_(["high", "medium"]))
+                )
+            ),
+        )
+        .order_by(NewsCluster.coreai_score.desc(), NewsCluster.product_score.desc(), NewsCluster.updated_at.asc())
         .limit(limit)
     )
     return result.scalars().all()

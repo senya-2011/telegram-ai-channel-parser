@@ -8,7 +8,8 @@ Telegram-бот, который отслеживает каналы и веб-и
 - **Управление подписками** — добавление/удаление Telegram-каналов и веб-ссылок
 - **Парсинг каналов** — автоматический сбор постов из Telegram-каналов через Telethon
 - **Парсинг веб-сайтов и API-источников** — RSS/HTML + Reddit/GitHub/Product Hunt
-- **AI-анализ** — один вызов DeepSeek на пост: summary + relevance + CoreAI score
+- **AI-анализ** — один вызов DeepSeek на пост: summary + relevance + CoreAI score + news_kind/product_score/priority
+- **Product-first фильтрация** — в алерты и дайджест в приоритете продуктовые AI/LLM новости, тренды и research ограниченно
 - **Теги новостей** — DeepSeek присваивает 1-3 хештега из фиксированной таксономии (для поиска в чате)
 - **Фильтр релевантности** — pre-filter + LLM, чтобы сократить лишние запросы
 - **Алерты:**
@@ -193,3 +194,13 @@ app/
 | `REACTIONS_MULTIPLIER` | Множитель для алерта реакций (по умолчанию `3.0`) |
 | `CLUSTER_MIN_MENTIONS` | Минимум упоминаний в кластере для similarity alert (по умолчанию `2`) |
 | `COREAI_ALERT_THRESHOLD` | Порог важности CoreAI для выделения кластера (по умолчанию `0.6`) |
+| `TREND_ALERTS_PER_CYCLE` | Максимум trend-алертов за цикл (по умолчанию `2`) |
+| `RESEARCH_ALERTS_PER_CYCLE` | Максимум research-алертов за цикл (по умолчанию `1`) |
+| `MIN_PRODUCT_SCORE_FOR_ALERT` | Минимальный product_score для продуктовых алертов (по умолчанию `0.55`) |
+| `MIN_NON_PRODUCT_CORE_SCORE_FOR_ALERT` | Минимальный core score для non-product алертов (по умолчанию `0.72`) |
+| `IMPORTANT_ALERT_CORE_SCORE` | Core score для "important" алерта даже без повторов (по умолчанию `0.88`) |
+| `IMPORTANT_ALERT_PRODUCT_SCORE` | Product score для "important" продуктового алерта (по умолчанию `0.75`) |
+| `IMPORTANT_ALERTS_PER_CYCLE` | Максимум важных алертов за цикл (по умолчанию `3`) |
+| `DIGEST_TARGET_ITEMS` | Целевое число пунктов в дайджесте (по умолчанию `10`) |
+| `DIGEST_PRODUCT_SHARE` | Доля продуктовых новостей в дайджесте (по умолчанию `0.75`) |
+| `DIGEST_MAX_NON_PRODUCT` | Максимум non-product пунктов в дайджесте (по умолчанию `3`) |

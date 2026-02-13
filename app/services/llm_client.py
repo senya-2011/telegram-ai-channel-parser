@@ -92,6 +92,10 @@ async def analyze_post(content: str) -> dict:
         "coreai_score": float (0..1),
         "coreai_reason": str,
         "tags": list[str],
+        "news_kind": str,
+        "product_score": float,
+        "priority": str,
+        "is_alert_worthy": bool,
       }
     """
     client = get_llm_client()
@@ -107,7 +111,15 @@ async def analyze_post(content: str) -> dict:
         "coreai_score: number от 0 до 1\n"
         "coreai_reason: string (почему это важно/не важно для CoreAI)\n"
         "tags: array<string> из 1-3 хештегов\n"
+        "news_kind: string из {product, trend, research, misc}\n"
+        "product_score: number от 0 до 1\n"
+        "priority: string из {high, medium, low}\n"
+        "is_alert_worthy: boolean\n"
         f"Используй только эти хештеги: {', '.join(NEWS_TAGS)}\n"
+        "КЛЮЧЕВОЕ: продуктовые новости (релизы, обновления, запуск AI/LLM функций в продуктах, API, агентах) должны получать высокий приоритет.\n"
+        "trend допускается только для действительно крупных сдвигов индустрии.\n"
+        "research — в основном научные результаты.\n"
+        "misc — второстепенные и слабо релевантные материалы.\n"
         "Критерии высокой важности для CoreAI:\n"
         "- релиз/обновление модели, продукта или API у ключевых игроков (OpenAI, Anthropic, Google, Meta, xAI, Mistral, DeepSeek)\n"
         "- новые бенчмарки, SOTA-результаты, научные прорывы\n"
@@ -148,6 +160,22 @@ async def analyze_post(content: str) -> dict:
         coreai_score = max(0.0, min(1.0, coreai_score))
 
         coreai_reason = str(data.get("coreai_reason", "")).strip()
+        news_kind = str(data.get("news_kind", "misc")).strip().lower()
+        if news_kind not in {"product", "trend", "research", "misc"}:
+            news_kind = "misc"
+        try:
+            product_score = float(data.get("product_score", 0.0))
+        except Exception:
+            product_score = 0.0
+        product_score = max(0.0, min(1.0, product_score))
+        priority = str(data.get("priority", "low")).strip().lower()
+        if priority not in {"high", "medium", "low"}:
+            priority = "low"
+        raw_alert = data.get("is_alert_worthy", False)
+        if isinstance(raw_alert, bool):
+            is_alert_worthy = raw_alert
+        else:
+            is_alert_worthy = str(raw_alert).strip().lower() in {"true", "yes", "1"}
         raw_tags = data.get("tags", [])
         if isinstance(raw_tags, str):
             raw_tags = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
@@ -164,6 +192,10 @@ async def analyze_post(content: str) -> dict:
             "coreai_score": coreai_score,
             "coreai_reason": coreai_reason,
             "tags": tags,
+            "news_kind": news_kind,
+            "product_score": product_score,
+            "priority": priority,
+            "is_alert_worthy": is_alert_worthy,
         }
     except Exception as e:
         logger.error(f"LLM combined analysis error: {e}")
@@ -174,6 +206,10 @@ async def analyze_post(content: str) -> dict:
             "coreai_score": 0.0,
             "coreai_reason": "LLM error fallback",
             "tags": ["#AIТехнологии"],
+            "news_kind": "misc",
+            "product_score": 0.0,
+            "priority": "low",
+            "is_alert_worthy": False,
         }
 
 
@@ -301,7 +337,9 @@ async def generate_digest_text(summaries: list[dict]) -> Optional[str]:
                     "role": "system",
                     "content": (
                         "Ты — редактор новостного дайджеста для Telegram. "
-                        "Составь краткий дайджест на основе новостей. Группируй похожие вместе.\n\n"
+                        "Составь краткий дайджест на основе новостей. Группируй похожие вместе.\n"
+                        "ФОКУС: преимущественно продуктовые новости про AI/LLM (релизы, обновления, продуктовые фичи, API).\n"
+                        "Тренды и исследования включай ограниченно, только если они действительно значимы.\n\n"
                         "СТРОГИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ:\n"
                         "- Используй ТОЛЬКО эти HTML-теги: <b>жирный</b>, <i>курсив</i>\n"
                         "- Для списков используй тире: - текст\n"

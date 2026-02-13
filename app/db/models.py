@@ -123,7 +123,7 @@ class Alert(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
-    alert_type = Column(String(50), nullable=False)  # 'similar' | 'reactions' | 'trend'
+    alert_type = Column(String(50), nullable=False)  # 'similar' | 'reactions' | 'trend' | 'important'
     reason = Column(Text, nullable=False)
     is_sent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
@@ -140,6 +140,10 @@ class NewsCluster(Base):
     canonical_text = Column(Text, nullable=False)
     canonical_summary = Column(Text, nullable=False)
     tags = Column(String(500), default="", nullable=False)  # comma-separated hashtags
+    news_kind = Column(String(20), default="misc", nullable=False)  # product | trend | research | misc
+    product_score = Column(Float, default=0.0, nullable=False)
+    priority = Column(String(10), default="low", nullable=False)  # high | medium | low
+    is_alert_worthy = Column(Boolean, default=False, nullable=False)
     embedding = Column(Vector(384), nullable=True)
     is_ai_relevant = Column(Boolean, default=True, nullable=False)
     mention_count = Column(Integer, default=1, nullable=False)

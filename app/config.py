@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     reactions_multiplier: float = 3.0
     cluster_min_mentions: int = 2
     coreai_alert_threshold: float = 0.6
+    trend_alerts_per_cycle: int = 2
+    research_alerts_per_cycle: int = 1
+    min_product_score_for_alert: float = 0.55
+    min_non_product_core_score_for_alert: float = 0.72
+    important_alert_core_score: float = 0.88
+    important_alert_product_score: float = 0.75
+    important_alerts_per_cycle: int = 3
+    digest_target_items: int = 10
+    digest_product_share: float = 0.75
+    digest_max_non_product: int = 3
 
     # Tavily (web search for discovering new sources)
     tavily_api_key: str = ""

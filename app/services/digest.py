@@ -3,6 +3,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.repositories import get_clusters_by_ids, get_posts_for_digest, get_source_by_id, get_user_sources
 from app.services.llm_client import generate_digest_text
 
@@ -46,6 +47,11 @@ def _short_headline(text: str, limit: int = 72) -> str:
     if len(sentence) > limit:
         sentence = sentence[:limit].rsplit(" ", 1)[0].strip() + "..."
     return sentence or "Подробнее"
+
+
+def _priority_rank(priority: str) -> int:
+    mapping = {"low": 1, "medium": 2, "high": 3}
+    return mapping.get((priority or "low").lower(), 1)
 
 
 def _inject_curated_links_inline(digest_text: str, items: list[dict]) -> str:
@@ -124,6 +130,51 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     cluster_ids = [p.cluster_id for p in unique_posts if p.cluster_id]
     clusters_map = await get_clusters_by_ids(session, cluster_ids)
 
+    def _post_sort_key(post):
+        cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        kind_weight = {"product": 4, "trend": 3, "research": 2, "misc": 1}.get(
+            (cluster.news_kind if cluster else "misc"),
+            1,
+        )
+        priority_weight = _priority_rank(cluster.priority if cluster else "low")
+        product_score = float(cluster.product_score) if cluster else 0.0
+        mentions = int(cluster.mention_count) if cluster else 1
+        return (kind_weight, priority_weight, product_score, mentions, post.reactions_count)
+
+    unique_posts.sort(key=_post_sort_key, reverse=True)
+
+    target_items = max(6, settings.digest_target_items)
+    product_target = max(1, int(target_items * settings.digest_product_share))
+    non_product_cap = max(1, settings.digest_max_non_product)
+
+    product_posts = []
+    trend_posts = []
+    research_posts = []
+    misc_posts = []
+    for post in unique_posts:
+        cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        kind = cluster.news_kind if cluster else "misc"
+        if kind == "product":
+            product_posts.append(post)
+        elif kind == "trend":
+            trend_posts.append(post)
+        elif kind == "research":
+            research_posts.append(post)
+        else:
+            misc_posts.append(post)
+
+    selected_posts = product_posts[:product_target]
+    non_product = trend_posts + research_posts + misc_posts
+    selected_posts.extend(non_product[:non_product_cap])
+    if len(selected_posts) < target_items:
+        already = {p.id for p in selected_posts}
+        for post in unique_posts:
+            if post.id in already:
+                continue
+            selected_posts.append(post)
+            if len(selected_posts) >= target_items:
+                break
+
     # Prepare summaries for LLM — fast local keyword filter (LLM check already done at processing time)
     _AI_KW = {
         "ai", "artificial intelligence", "ml", "machine learning", "deep learning",
@@ -138,7 +189,7 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
         return any(kw in t for kw in _AI_KW)
 
     summaries = []
-    for post in unique_posts:
+    for post in selected_posts:
         post_text = post.summary or post.content[:300]
 
         # Fast keyword filter — skip obvious non-AI posts
