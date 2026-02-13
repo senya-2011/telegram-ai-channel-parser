@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     important_alert_core_score: float = 0.88
     important_alert_product_score: float = 0.75
     important_alerts_per_cycle: int = 3
+    business_impact_high_threshold: float = 0.78
+    business_impact_max_sources: int = 5
     digest_target_items: int = 10
     digest_product_share: float = 0.75
     digest_max_non_product: int = 3

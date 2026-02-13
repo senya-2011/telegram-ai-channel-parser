@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.repositories import get_clusters_by_ids, get_posts_for_digest, get_source_by_id, get_user_sources
-from app.services.llm_client import generate_digest_text
+from app.services.llm_client import analyze_business_impact, generate_digest_text
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,14 @@ def _short_headline(text: str, limit: int = 72) -> str:
 def _priority_rank(priority: str) -> int:
     mapping = {"low": 1, "medium": 2, "high": 3}
     return mapping.get((priority or "low").lower(), 1)
+
+
+def _trim_text(text: str, limit: int = 120) -> str:
+    value = (text or "").strip().replace("\n", " ")
+    if len(value) <= limit:
+        return value
+    short = value[:limit].rsplit(" ", 1)[0].strip()
+    return (short or value[:limit]).rstrip(".,;:") + "..."
 
 
 def _inject_curated_links_inline(digest_text: str, items: list[dict]) -> str:
@@ -218,19 +226,20 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
 
     if digest_text:
         digest_text = _inject_curated_links_inline(digest_text, summaries)
+        business_block = await _build_digest_business_impact_block(summaries)
 
         # Deterministic per-news section with inline tags (LLM output may reorder/omit markers).
         per_news_section = "\n\n🧷 <b>Новости по источникам:</b>\n"
-        for i, s in enumerate(summaries[:10], 1):
+        for i, s in enumerate(summaries[:6], 1):
             mentions_text = f" | 📈 {s['mentions']} источн." if s.get("mentions", 1) >= 2 else ""
-            short_summary = (s["summary"] or "")[:180]
+            short_summary = _trim_text(s["summary"] or "", 120)
             link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s.get("link") else ""
             per_news_section += (
                 f'{i}. <b>{s["source"]}</b>\n'
                 f'🏷 {s.get("tags") or "#AIТехнологии"}{mentions_text}\n'
                 f'{short_summary}{link_text}\n\n'
             )
-        digest_text += per_news_section
+        digest_text += business_block + per_news_section
     else:
         # Fallback: simple list with links, HTML format
         digest_text = "📰 <b>Дайджест за сегодня:</b>\n\n"
@@ -240,3 +249,64 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
             digest_text += f'{i}. <b>{s["source"]}</b> (👍 {s["reactions"]}{mentions_text})\n{s["summary"]}{link_text}\n\n'
 
     return digest_text
+
+
+async def _build_digest_business_impact_block(summaries: list[dict]) -> str:
+    if not settings.tavily_api_key or not summaries:
+        return ""
+
+    candidates = sorted(
+        summaries,
+        key=lambda s: (s.get("mentions", 1), s.get("reactions", 0)),
+        reverse=True,
+    )[:2]
+
+    if not candidates:
+        return ""
+
+    try:
+        from tavily import AsyncTavilyClient
+    except Exception:
+        return ""
+
+    client = AsyncTavilyClient(api_key=settings.tavily_api_key)
+    lines = ["\n\n🏢 <b>Влияние на бизнес (прецеденты):</b>"]
+
+    for i, item in enumerate(candidates, 1):
+        summary = item.get("summary", "")
+        try:
+            response = await client.search(
+                query=f"{summary[:180]} business impact case",
+                search_depth="basic",
+                max_results=min(4, settings.business_impact_max_sources),
+                include_answer=False,
+            )
+            contexts = []
+            for res in response.get("results", [])[: min(4, settings.business_impact_max_sources)]:
+                contexts.append({
+                    "title": res.get("title", "")[:110],
+                    "snippet": res.get("content", "")[:220],
+                    "url": res.get("url", ""),
+                })
+            if not contexts:
+                continue
+            analysis = await analyze_business_impact(summary, contexts)
+            positives = analysis.get("positive_precedents", [])[:1]
+            negatives = analysis.get("negative_precedents", [])[:1]
+            score = float(analysis.get("impact_score", 0.0))
+
+            lines.append(f"{i}. <b>{item.get('source', 'Источник')}</b> — score {score:.2f}")
+            if positives:
+                lines.append(f"✅ {_trim_text(positives[0], 130)}")
+            if negatives:
+                lines.append(f"⚠️ {_trim_text(negatives[0], 130)}")
+            ref_url = contexts[0].get("url")
+            if ref_url:
+                lines.append(f'🔗 <a href="{ref_url}">Прецедент</a>')
+            lines.append("")
+        except Exception as e:
+            logger.debug(f"Digest business impact failed for item {i}: {e}")
+
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines)

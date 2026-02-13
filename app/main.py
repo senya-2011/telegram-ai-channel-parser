@@ -38,6 +38,7 @@ async def main():
             BotCommand(command="start", description="Начало работы"),
             BotCommand(command="menu", description="Открыть меню"),
             BotCommand(command="status", description="Статистика парсинга"),
+            BotCommand(command="quality", description="Качество ленты"),
             BotCommand(command="help", description="Справка"),
         ])
 

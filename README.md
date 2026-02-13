@@ -201,6 +201,8 @@ app/
 | `IMPORTANT_ALERT_CORE_SCORE` | Core score для "important" алерта даже без повторов (по умолчанию `0.88`) |
 | `IMPORTANT_ALERT_PRODUCT_SCORE` | Product score для "important" продуктового алерта (по умолчанию `0.75`) |
 | `IMPORTANT_ALERTS_PER_CYCLE` | Максимум важных алертов за цикл (по умолчанию `3`) |
+| `BUSINESS_IMPACT_HIGH_THRESHOLD` | Порог impact score для повышения алерта до important (по умолчанию `0.78`) |
+| `BUSINESS_IMPACT_MAX_SOURCES` | Сколько источников Tavily использовать для блока бизнес-эффекта (по умолчанию `5`) |
 | `DIGEST_TARGET_ITEMS` | Целевое число пунктов в дайджесте (по умолчанию `10`) |
 | `DIGEST_PRODUCT_SHARE` | Доля продуктовых новостей в дайджесте (по умолчанию `0.75`) |
 | `DIGEST_MAX_NON_PRODUCT` | Максимум non-product пунктов в дайджесте (по умолчанию `3`) |

@@ -29,7 +29,7 @@ from app.db.repositories import (
     mark_cluster_alert_sent,
 )
 from app.services.embedding import cosine_similarity, generate_embedding
-from app.services.llm_client import analyze_post, check_similarity
+from app.services.llm_client import analyze_business_impact, analyze_post, check_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -339,8 +339,11 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
         seen_ids.add(cluster.id)
         filtered.append(cluster)
 
+    business_cache: dict[int, dict] = {}
+
     for cluster in filtered:
         try:
+            business_insight = await _build_business_impact_block(cluster, business_cache)
             alert_type = "important" if (
                 cluster.coreai_score >= settings.important_alert_core_score
                 or (
@@ -348,8 +351,15 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
                     and cluster.product_score >= settings.important_alert_product_score
                     and cluster.priority in {"high", "medium"}
                 )
+                or (business_insight.get("impact_score", 0.0) >= settings.business_impact_high_threshold)
             ) else "similar"
-            await _send_similarity_alert_for_cluster(session, bot, cluster, alert_type=alert_type)
+            await _send_similarity_alert_for_cluster(
+                session,
+                bot,
+                cluster,
+                alert_type=alert_type,
+                business_insight=business_insight,
+            )
             await mark_cluster_alert_sent(session, cluster.id)
         except Exception as e:
             logger.error(f"Error sending cluster alert {cluster.id}: {e}")
@@ -426,6 +436,7 @@ async def _send_similarity_alert_for_cluster(
     bot: Bot,
     cluster: NewsCluster,
     alert_type: str = "similar",
+    business_insight: dict | None = None,
 ) -> None:
     posts = await get_posts_for_cluster(session, cluster.id, limit=30)
     if not posts:
@@ -472,6 +483,7 @@ async def _send_similarity_alert_for_cluster(
         f"🏷 <b>Теги:</b> {tags_text}\n"
         f"📡 <b>Источников:</b> {cluster.mention_count}\n"
         f"{coreai_line}"
+        f"{business_insight.get('block', '') if business_insight else ''}"
         f"\n{chr(10).join(links_lines)}"
     )
 
@@ -534,3 +546,61 @@ async def _send_alert_to_user(bot: Bot, session: AsyncSession, user_id: int, tex
                 await bot.send_message(tg_id, text, reply_markup=keyboard)
             except Exception as e:
                 logger.error(f"Failed to send alert to tg_id={tg_id}: {e}")
+
+
+async def _build_business_impact_block(cluster: NewsCluster, cache: dict[int, dict]) -> dict:
+    cached = cache.get(cluster.id)
+    if cached:
+        return cached
+
+    if not settings.tavily_api_key:
+        result = {"impact_score": 0.0, "block": ""}
+        cache[cluster.id] = result
+        return result
+
+    contexts = []
+    try:
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=settings.tavily_api_key)
+        response = await client.search(
+            query=f"{cluster.canonical_summary[:180]} business impact case study",
+            search_depth="basic",
+            max_results=max(3, settings.business_impact_max_sources),
+            include_answer=False,
+        )
+        for item in response.get("results", [])[: settings.business_impact_max_sources]:
+            title = item.get("title", "")[:120]
+            snippet = item.get("content", "")[:280]
+            url = item.get("url", "")
+            if not (title or snippet):
+                continue
+            contexts.append({"title": title, "snippet": snippet, "url": url})
+    except Exception as e:
+        logger.debug(f"Business impact Tavily fetch failed for cluster {cluster.id}: {e}")
+
+    if not contexts:
+        result = {"impact_score": 0.0, "block": ""}
+        cache[cluster.id] = result
+        return result
+
+    analysis = await analyze_business_impact(cluster.canonical_summary, contexts)
+    impact_score = float(analysis.get("impact_score", 0.0))
+    positives = analysis.get("positive_precedents", [])[:2]
+    negatives = analysis.get("negative_precedents", [])[:2]
+    conclusion = _soft_limit(analysis.get("conclusion", ""), max_len=260)
+
+    lines = [f"\n📊 <b>Эффект на бизнес:</b> score={impact_score:.2f}"]
+    if positives:
+        lines.append("✅ " + "; ".join(_soft_limit(p, 120) for p in positives))
+    if negatives:
+        lines.append("⚠️ " + "; ".join(_soft_limit(n, 120) for n in negatives))
+    if conclusion:
+        lines.append("🧠 " + conclusion)
+    if contexts:
+        ref = contexts[0]
+        if ref.get("url"):
+            lines.append(f'🔎 <a href="{ref["url"]}">Прецедент</a>')
+
+    result = {"impact_score": impact_score, "block": "\n".join(lines) + "\n"}
+    cache[cluster.id] = result
+    return result

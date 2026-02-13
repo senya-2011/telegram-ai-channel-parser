@@ -360,7 +360,7 @@ async def generate_digest_text(summaries: list[dict]) -> Optional[str]:
                     "content": f"Вот новости за сегодня:\n\n{posts_text}",
                 },
             ],
-            max_tokens=1500,
+            max_tokens=1100,
             temperature=0.5,
         )
         digest = response.choices[0].message.content.strip()
@@ -368,3 +368,86 @@ async def generate_digest_text(summaries: list[dict]) -> Optional[str]:
     except Exception as e:
         logger.error(f"LLM digest generation error: {e}")
         return None
+
+
+async def analyze_business_impact(summary: str, contexts: list[dict]) -> dict:
+    """
+    Analyze real business impact with positive and negative precedents.
+    contexts: list of {"title": str, "snippet": str, "url": str}
+    Returns:
+      {
+        "impact_score": float 0..1,
+        "positive_precedents": list[str],
+        "negative_precedents": list[str],
+        "conclusion": str,
+      }
+    """
+    client = get_llm_client()
+
+    context_text = "\n\n".join(
+        f"[{c.get('title', 'source')}]\n{c.get('snippet', '')}\nURL: {c.get('url', '')}"
+        for c in contexts[:8]
+    )
+
+    prompt = (
+        "Ты аналитик влияния AI-новостей на реальный бизнес.\n"
+        "Нужно оценить практический эффект новости на компании, команды и пользователей.\n"
+        "Верни СТРОГО JSON с полями:\n"
+        "impact_score: number от 0 до 1\n"
+        "positive_precedents: array<string> (1-3 коротких пункта)\n"
+        "negative_precedents: array<string> (1-3 коротких пункта)\n"
+        "conclusion: string (1-2 предложения)\n"
+        "Оценивай выше, если есть конкретные кейсы внедрения, влияние на выручку/издержки/риск.\n"
+        "Никакого markdown и текста вне JSON."
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Новость:\n{summary[:1200]}\n\n"
+                        f"Контекст из внешних источников:\n{context_text[:5000]}"
+                    ),
+                },
+            ],
+            max_tokens=400,
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content.strip()
+        data = _extract_json_object(raw)
+
+        try:
+            impact_score = float(data.get("impact_score", 0.0))
+        except Exception:
+            impact_score = 0.0
+        impact_score = max(0.0, min(1.0, impact_score))
+
+        positive = data.get("positive_precedents", [])
+        if not isinstance(positive, list):
+            positive = []
+        positive = [str(x).strip() for x in positive if str(x).strip()][:3]
+
+        negative = data.get("negative_precedents", [])
+        if not isinstance(negative, list):
+            negative = []
+        negative = [str(x).strip() for x in negative if str(x).strip()][:3]
+
+        conclusion = str(data.get("conclusion", "")).strip()
+        return {
+            "impact_score": impact_score,
+            "positive_precedents": positive,
+            "negative_precedents": negative,
+            "conclusion": conclusion,
+        }
+    except Exception as e:
+        logger.error(f"LLM business impact analysis error: {e}")
+        return {
+            "impact_score": 0.0,
+            "positive_precedents": [],
+            "negative_precedents": [],
+            "conclusion": "",
+        }
