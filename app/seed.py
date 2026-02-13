@@ -6,6 +6,8 @@ Run once after migrations:
 import asyncio
 import logging
 
+from sqlalchemy import text
+
 from app.db.database import async_session
 from app.db.repositories import get_or_create_source
 
@@ -116,6 +118,23 @@ async def seed_defaults():
                 is_default=True,
             )
             logger.info(f"  [producthunt] {identifier} -> id={source.id}")
+
+        # Ensure all existing users are subscribed to all default sources.
+        # Safe to rerun due to ON CONFLICT DO NOTHING.
+        result = await session.execute(
+            text(
+                """
+                INSERT INTO user_sources (user_id, source_id)
+                SELECT u.id, s.id
+                FROM users u
+                CROSS JOIN sources s
+                WHERE s.is_default = true
+                ON CONFLICT (user_id, source_id) DO NOTHING
+                """
+            )
+        )
+        await session.commit()
+        logger.info(f"  [subscriptions] added default subscriptions for existing users: {result.rowcount}")
 
     logger.info("Seeding complete!")
 
