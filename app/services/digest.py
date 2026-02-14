@@ -4,8 +4,16 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.repositories import get_clusters_by_ids, get_posts_for_digest, get_source_by_id, get_user_sources
-from app.services.llm_client import analyze_business_impact, generate_digest_text
+from app.db.repositories import (
+    get_clusters_by_ids,
+    get_posts_for_digest,
+    get_source_by_id,
+    get_user_disliked_clusters,
+    get_user_settings,
+    get_user_sources,
+)
+from app.services.embedding import cosine_similarity, generate_embedding
+from app.services.llm_client import analyze_business_impact, generate_digest_text, score_user_prompt_relevance
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +70,38 @@ def _trim_text(text: str, limit: int = 120) -> str:
     return (short or value[:limit]).rstrip(".,;:") + "..."
 
 
+def _is_digest_candidate(cluster) -> bool:
+    if not cluster or not cluster.is_ai_relevant:
+        return False
+
+    kind = (cluster.news_kind or "misc").lower()
+    priority = (cluster.priority or "low").lower()
+    product_score = float(cluster.product_score or 0.0)
+    core_score = float(cluster.coreai_score or 0.0)
+    alert_worthy = bool(cluster.is_alert_worthy)
+    implementable = bool(cluster.implementable_by_small_team)
+    barrier = (cluster.infra_barrier or "high").lower()
+
+    # В дайджест и алерты только то, что можно реализовать: реализуемо малой командой или низкий/средний инфра-барьер
+    if not implementable and barrier not in {"low", "medium"}:
+        return False
+
+    if kind == "product":
+        min_product = max(0.45, settings.min_product_score_for_alert - 0.05)
+        return (
+            alert_worthy
+            or (implementable and barrier in {"low", "medium"})
+            or (priority in {"high", "medium"} and product_score >= min_product)
+        )
+    if kind == "tech_update":
+        return alert_worthy and (product_score >= 0.45 or priority in {"high", "medium"})
+    if kind == "industry_report":
+        return alert_worthy and core_score >= max(0.7, settings.min_non_product_core_score_for_alert)
+    if kind in {"trend", "research"}:
+        return alert_worthy and core_score >= settings.min_non_product_core_score_for_alert
+    return False
+
+
 def _inject_curated_links_inline(digest_text: str, items: list[dict]) -> str:
     """
     Add "Подробнее" line under each bullet in curated sections:
@@ -106,7 +146,11 @@ def _inject_curated_links_inline(digest_text: str, items: list[dict]) -> str:
     return "\n".join(out)
 
 
-async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optional[str]:
+async def generate_digest_for_user(
+    session: AsyncSession,
+    user_id: int,
+    mode: str = "main",
+) -> Optional[str]:
     """
     Generate a daily digest for a specific user.
     Collects top posts from the user's subscribed sources,
@@ -137,17 +181,52 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
 
     cluster_ids = [p.cluster_id for p in unique_posts if p.cluster_id]
     clusters_map = await get_clusters_by_ids(session, cluster_ids)
+    user_settings = await get_user_settings(session, user_id)
+    include_tech = bool(getattr(user_settings, "include_tech_updates", False))
+    include_reports = bool(getattr(user_settings, "include_industry_reports", False))
+    user_prompt = (getattr(user_settings, "user_prompt", "") or "").strip()
+
+    # Убрать из дайджеста кластеры, похожие на те, что пользователь отметил «Мимо» (по смыслу, не по типу)
+    def _usable_emb(emb):
+        if emb is None:
+            return False
+        try:
+            return len(emb) > 0
+        except (TypeError, AttributeError):
+            return False
+
+    threshold = settings.feedback_dislike_similarity_threshold
+    disliked_embeddings = []
+    if threshold < 1.0:
+        for dc in await get_user_disliked_clusters(session, user_id):
+            emb = getattr(dc, "embedding", None) if dc else None
+            if not _usable_emb(emb) and dc and getattr(dc, "canonical_summary", None):
+                emb = generate_embedding(dc.canonical_summary[:2000])
+            if _usable_emb(emb):
+                disliked_embeddings.append(emb)
+    def _cluster_similar_to_disliked(cluster) -> bool:
+        if not cluster or not disliked_embeddings or threshold >= 1.0:
+            return False
+        c_emb = getattr(cluster, "embedding", None)
+        if not _usable_emb(c_emb) and getattr(cluster, "canonical_summary", None):
+            c_emb = generate_embedding(cluster.canonical_summary[:2000])
+        if not _usable_emb(c_emb):
+            return False
+        return any(cosine_similarity(c_emb, d) >= threshold for d in disliked_embeddings)
+    unique_posts = [p for p in unique_posts if not (p.cluster_id and _cluster_similar_to_disliked(clusters_map.get(p.cluster_id)))]
 
     def _post_sort_key(post):
         cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
-        kind_weight = {"product": 4, "trend": 3, "research": 2, "misc": 1}.get(
+        kind_weight = {"product": 6, "tech_update": 4, "industry_report": 3, "trend": 2, "research": 1, "misc": 0}.get(
             (cluster.news_kind if cluster else "misc"),
             1,
         )
         priority_weight = _priority_rank(cluster.priority if cluster else "low")
         product_score = float(cluster.product_score) if cluster else 0.0
         mentions = int(cluster.mention_count) if cluster else 1
-        return (kind_weight, priority_weight, product_score, mentions, post.reactions_count)
+        implementable = 1 if (cluster and cluster.implementable_by_small_team) else 0
+        barrier_penalty = 0 if not cluster else {"low": 0.1, "medium": 0.0, "high": -0.2}.get(cluster.infra_barrier, -0.1)
+        return (kind_weight, implementable, priority_weight, product_score + barrier_penalty, mentions, post.reactions_count)
 
     unique_posts.sort(key=_post_sort_key, reverse=True)
 
@@ -156,29 +235,61 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
     non_product_cap = max(1, settings.digest_max_non_product)
 
     product_posts = []
+    tech_posts = []
+    report_posts = []
     trend_posts = []
     research_posts = []
-    misc_posts = []
     for post in unique_posts:
         cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        if not _is_digest_candidate(cluster):
+            continue
         kind = cluster.news_kind if cluster else "misc"
+        if mode == "tech_update" and kind != "tech_update":
+            continue
+        if mode == "industry_report" and kind != "industry_report":
+            continue
+        if mode == "main":
+            if kind == "tech_update" and not include_tech:
+                continue
+            if kind == "industry_report" and not include_reports:
+                continue
         if kind == "product":
             product_posts.append(post)
+        elif kind == "tech_update":
+            tech_posts.append(post)
+        elif kind == "industry_report":
+            report_posts.append(post)
         elif kind == "trend":
             trend_posts.append(post)
         elif kind == "research":
             research_posts.append(post)
-        else:
-            misc_posts.append(post)
 
-    selected_posts = product_posts[:product_target]
-    non_product = trend_posts + research_posts + misc_posts
-    selected_posts.extend(non_product[:non_product_cap])
+    if mode == "tech_update":
+        selected_posts = tech_posts[:target_items]
+    elif mode == "industry_report":
+        selected_posts = report_posts[:target_items]
+    else:
+        selected_posts = product_posts[:product_target]
+        non_product = tech_posts + report_posts + trend_posts + research_posts
+        selected_posts.extend(non_product[:non_product_cap])
     if len(selected_posts) < target_items:
         already = {p.id for p in selected_posts}
         for post in unique_posts:
             if post.id in already:
                 continue
+            cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+            if not _is_digest_candidate(cluster):
+                continue
+            kind = cluster.news_kind if cluster else "misc"
+            if mode == "tech_update" and kind != "tech_update":
+                continue
+            if mode == "industry_report" and kind != "industry_report":
+                continue
+            if mode == "main":
+                if kind == "tech_update" and not include_tech:
+                    continue
+                if kind == "industry_report" and not include_reports:
+                    continue
             selected_posts.append(post)
             if len(selected_posts) >= target_items:
                 break
@@ -211,6 +322,17 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
         cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
         mentions = cluster.mention_count if cluster else 1
         tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
+        analogs_text = cluster.analogs if cluster and cluster.analogs else ""
+        action_item = cluster.action_item if cluster and cluster.action_item else ""
+        news_kind = cluster.news_kind if cluster else "misc"
+        product_score = float(cluster.product_score) if cluster else 0.0
+        coreai_score = float(cluster.coreai_score) if cluster else 0.0
+        if not action_item and news_kind == "product":
+            action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
+
+        user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
+        if user_prompt and user_relevance_score < settings.user_prompt_min_score and mode == "main":
+            continue
 
         summaries.append({
             "source": source_title,
@@ -219,7 +341,25 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
             "link": link,
             "mentions": mentions,
             "tags": tags_text,
+            "analogs": analogs_text,
+            "action_item": action_item,
+            "news_kind": news_kind,
+            "product_score": product_score,
+            "coreai_score": coreai_score,
+            "user_relevance_score": user_relevance_score,
         })
+
+    if not summaries:
+        mode_human = {
+            "main": "продуктовых",
+            "tech_update": "технологических обновлений",
+            "industry_report": "отчётов и аналитики",
+        }.get(mode, "релевантных")
+        return (
+            "📰 <b>Дайджест за сегодня</b>\n\n"
+            f"Пока нет релевантных {mode_human} AI/LLM-новостей высокого качества. "
+            "Следующий цикл парсинга добавит новые кандидаты."
+        )
 
     # Generate digest via LLM
     digest_text = await generate_digest_text(summaries)
@@ -237,7 +377,10 @@ async def generate_digest_for_user(session: AsyncSession, user_id: int) -> Optio
             per_news_section += (
                 f'{i}. <b>{s["source"]}</b>\n'
                 f'🏷 {s.get("tags") or "#AIТехнологии"}{mentions_text}\n'
-                f'{short_summary}{link_text}\n\n'
+                f'{short_summary}\n'
+                f'🧩 Аналоги: {s.get("analogs") or "нет явных"}\n'
+                f'✅ Action: {s.get("action_item") or "Нет явного продуктового action"}'
+                f'{link_text}\n\n'
             )
         digest_text += business_block + per_news_section
     else:
@@ -255,9 +398,17 @@ async def _build_digest_business_impact_block(summaries: list[dict]) -> str:
     if not settings.tavily_api_key or not summaries:
         return ""
 
+    quality_candidates = [
+        s for s in summaries
+        if (
+            s.get("news_kind") == "product" and float(s.get("product_score", 0.0)) >= 0.6
+        ) or (
+            s.get("news_kind") in {"trend", "research"} and float(s.get("coreai_score", 0.0)) >= 0.8
+        )
+    ]
     candidates = sorted(
-        summaries,
-        key=lambda s: (s.get("mentions", 1), s.get("reactions", 0)),
+        quality_candidates,
+        key=lambda s: (s.get("product_score", 0.0), s.get("coreai_score", 0.0), s.get("mentions", 1)),
         reverse=True,
     )[:2]
 

@@ -38,6 +38,8 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
     clusters_product_24h = 0
     clusters_trend_24h = 0
     clusters_research_24h = 0
+    clusters_tech_update_24h = 0
+    clusters_industry_report_24h = 0
     clusters_misc_24h = 0
     if source_ids:
         import datetime
@@ -96,6 +98,8 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
             clusters_product_24h = int(kind_map.get("product", 0))
             clusters_trend_24h = int(kind_map.get("trend", 0))
             clusters_research_24h = int(kind_map.get("research", 0))
+            clusters_tech_update_24h = int(kind_map.get("tech_update", 0))
+            clusters_industry_report_24h = int(kind_map.get("industry_report", 0))
             clusters_misc_24h = int(kind_map.get("misc", 0))
 
     # Alerts for this user
@@ -112,8 +116,8 @@ async def cmd_status(message: Message, user: User | None, session: AsyncSession)
         f"🤖 Обработано постов: **{processed_posts}**\n"
         f"🧩 Кластеров новостей всего: **{total_clusters}**\n"
         f"🕐 Кластеров за 24ч: **{clusters_24h}**\n"
-        f"📦 Product/Trend/Research/Misc (24ч): "
-        f"**{clusters_product_24h}/{clusters_trend_24h}/{clusters_research_24h}/{clusters_misc_24h}**\n"
+        f"📦 Product/TechUpdate/Report/Trend/Research/Misc (24ч): "
+        f"**{clusters_product_24h}/{clusters_tech_update_24h}/{clusters_industry_report_24h}/{clusters_trend_24h}/{clusters_research_24h}/{clusters_misc_24h}**\n"
         f"🔔 Ваших алертов: **{total_alerts}**\n\n"
         f"_Парсинг каналов: каждые 10 мин_\n"
         f"_Парсинг ссылок/API: каждые 30 мин_",
@@ -147,7 +151,10 @@ async def cmd_help(message: Message, user: User | None):
         "/menu — открыть главное меню\n"
         "/status — статистика парсинга\n"
         "/quality — качество ленты (product/trend/research/misc)\n"
-        "/help — справка по командам",
+        "/help — справка по командам\n\n"
+        "В меню доступны отдельные дайджесты:\n"
+        "- 🧱 Обновления технологий\n"
+        "- 📊 Отчёты и аналитика",
         parse_mode="Markdown",
     )
 
@@ -191,8 +198,10 @@ async def cmd_quality(message: Message, user: User | None, session: AsyncSession
     product = kind_map.get("product", 0)
     trend = kind_map.get("trend", 0)
     research = kind_map.get("research", 0)
+    tech_update = kind_map.get("tech_update", 0)
+    industry_report = kind_map.get("industry_report", 0)
     misc = kind_map.get("misc", 0)
-    total = product + trend + research + misc
+    total = product + tech_update + industry_report + trend + research + misc
     product_share = (product / total * 100) if total else 0.0
 
     alert_types = await session.execute(
@@ -206,6 +215,8 @@ async def cmd_quality(message: Message, user: User | None, session: AsyncSession
         f"🎯 **Качество ленты (24ч)**\n\n"
         f"🧩 Кластеры: **{total}**\n"
         f"📦 Product: **{product}** ({product_share:.1f}%)\n"
+        f"🧱 Tech update: **{tech_update}**\n"
+        f"📊 Industry report: **{industry_report}**\n"
         f"📈 Trend: **{trend}**\n"
         f"🧪 Research: **{research}**\n"
         f"🗂 Misc: **{misc}**\n\n"

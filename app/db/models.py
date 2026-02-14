@@ -52,6 +52,9 @@ class UserSettings(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     digest_time = Column(String(5), default="20:00")  # HH:MM format
     timezone = Column(String(50), default="Europe/Moscow")
+    include_tech_updates = Column(Boolean, default=False, nullable=False)
+    include_industry_reports = Column(Boolean, default=False, nullable=False)
+    user_prompt = Column(Text, nullable=True)
 
     user = relationship("User", back_populates="settings")
 
@@ -125,6 +128,7 @@ class Alert(Base):
     post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
     alert_type = Column(String(50), nullable=False)  # 'similar' | 'reactions' | 'trend' | 'important'
     reason = Column(Text, nullable=False)
+    user_relevance_score = Column(Float, nullable=True)
     is_sent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
@@ -140,7 +144,15 @@ class NewsCluster(Base):
     canonical_text = Column(Text, nullable=False)
     canonical_summary = Column(Text, nullable=False)
     tags = Column(String(500), default="", nullable=False)  # comma-separated hashtags
-    news_kind = Column(String(20), default="misc", nullable=False)  # product | trend | research | misc
+    analogs = Column(Text, default="", nullable=False)  # comma-separated competitor analogs
+    action_item = Column(Text, nullable=True)
+    news_kind = Column(
+        String(20),
+        default="misc",
+        nullable=False,
+    )  # product | trend | research | tech_update | industry_report | misc
+    implementable_by_small_team = Column(Boolean, default=False, nullable=False)
+    infra_barrier = Column(String(10), default="high", nullable=False)  # low | medium | high
     product_score = Column(Float, default=0.0, nullable=False)
     priority = Column(String(10), default="low", nullable=False)  # high | medium | low
     is_alert_worthy = Column(Boolean, default=False, nullable=False)
@@ -161,3 +173,18 @@ class NewsCluster(Base):
     )
 
     posts = relationship("Post", back_populates="cluster")
+
+
+class UserNewsFeedback(Base):
+    __tablename__ = "user_news_feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    cluster_id = Column(Integer, ForeignKey("news_clusters.id", ondelete="CASCADE"), nullable=False, index=True)
+    vote = Column(Integer, nullable=False)  # 1 like, -1 dislike
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "cluster_id", name="uq_user_cluster_feedback"),
+    )

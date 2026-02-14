@@ -8,7 +8,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.db.database import async_session
-from app.db.repositories import get_all_users_with_settings, get_telegram_ids_for_user, get_user_settings
+from app.db.repositories import (
+    delete_old_orphan_posts,
+    get_all_users_with_settings,
+    get_telegram_ids_for_user,
+    get_user_settings,
+)
 from app.services.alerts import process_new_posts
 from app.services.api_sources_parser import parse_api_sources
 from app.services.digest import generate_digest_for_user
@@ -141,6 +146,26 @@ async def task_send_digests(bot: Bot):
             logger.error(f"Error generating digest for user {username}: {e}")
 
 
+async def task_prune_orphan_posts(bot: Bot):
+    """
+    Удаляет старые посты без кластера (не продукт/технология/анализ).
+    Выполняется только если в настройках включено prune_irrelevant_posts.
+    """
+    if not settings.prune_irrelevant_posts:
+        return
+    try:
+        async with async_session() as session:
+            deleted = await delete_old_orphan_posts(
+                session,
+                older_than_days=settings.irrelevant_post_retention_days,
+                limit=settings.prune_irrelevant_limit,
+            )
+            if deleted:
+                logger.info(f"[Scheduler] Pruned {deleted} old orphan posts")
+    except Exception as e:
+        logger.error(f"[Scheduler] Prune orphan posts error: {e}")
+
+
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Create and configure the APScheduler."""
     scheduler = AsyncIOScheduler()
@@ -176,6 +201,16 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         name="Send Digests",
         replace_existing=True,
         max_instances=3,  # allow overlap if generation takes >1 min
+    )
+
+    # Prune old posts without cluster (not product/tech/analysis) once per day at 04:00 UTC
+    scheduler.add_job(
+        task_prune_orphan_posts,
+        trigger=CronTrigger(hour=4, minute=0),
+        args=[bot],
+        id="prune_orphan_posts",
+        name="Prune Orphan Posts",
+        replace_existing=True,
     )
 
     return scheduler

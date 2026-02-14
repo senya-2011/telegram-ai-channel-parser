@@ -93,9 +93,13 @@ async def analyze_post(content: str) -> dict:
         "coreai_reason": str,
         "tags": list[str],
         "news_kind": str,
+        "implementable_by_small_team": bool,
+        "infra_barrier": str,
         "product_score": float,
         "priority": str,
         "is_alert_worthy": bool,
+        "analogs": list[str],
+        "action_item": str,
       }
     """
     client = get_llm_client()
@@ -104,31 +108,68 @@ async def analyze_post(content: str) -> dict:
         content = content[:4000] + "..."
 
     prompt = (
-        "Ты аналитик CoreAI. Нужно определить ценность новости для мониторинга AI-индустрии.\n"
+        "Ты продуктовый AI-аналитик для команды CoreAI.\n"
+        "Твоя цель: отбирать новости, которые помогают создавать и улучшать AI/LLM-продукты.\n"
+        "ФОКУС: реальные кейсы успеха продуктов (трафик, выручка, экзит, внедрение с цифрами). Анонсы вендоров (модели, API, агенты) — это технологии, не product.\n\n"
         "Верни ответ СТРОГО в JSON с полями:\n"
-        "summary: string (кратко 2-3 предложения на русском)\n"
-        "is_relevant: boolean (true только для реальной новости/статьи по AI/ML/LLM)\n"
+        "summary: string (2-3 предложения на русском, только факты)\n"
+        "is_relevant: boolean\n"
         "coreai_score: number от 0 до 1\n"
-        "coreai_reason: string (почему это важно/не важно для CoreAI)\n"
+        "coreai_reason: string (1-2 предложения, почему важно/не важно для CoreAI)\n"
+        "analogs: array<string> (0-3 названия конкурентов/аналогов, которых стоит посмотреть)\n"
+        "action_item: string (одно конкретное действие для CoreAI, формулировка в повелительном стиле)\n"
         "tags: array<string> из 1-3 хештегов\n"
-        "news_kind: string из {product, trend, research, misc}\n"
+        "news_kind: string из {product, trend, research, tech_update, industry_report, misc}\n"
+        "implementable_by_small_team: boolean\n"
+        "infra_barrier: string из {low, medium, high}\n"
         "product_score: number от 0 до 1\n"
         "priority: string из {high, medium, low}\n"
-        "is_alert_worthy: boolean\n"
-        f"Используй только эти хештеги: {', '.join(NEWS_TAGS)}\n"
-        "КЛЮЧЕВОЕ: продуктовые новости (релизы, обновления, запуск AI/LLM функций в продуктах, API, агентах) должны получать высокий приоритет.\n"
-        "trend допускается только для действительно крупных сдвигов индустрии.\n"
-        "research — в основном научные результаты.\n"
-        "misc — второстепенные и слабо релевантные материалы.\n"
-        "Критерии высокой важности для CoreAI:\n"
-        "- релиз/обновление модели, продукта или API у ключевых игроков (OpenAI, Anthropic, Google, Meta, xAI, Mistral, DeepSeek)\n"
-        "- новые бенчмарки, SOTA-результаты, научные прорывы\n"
-        "- крупные инвестиции, M&A, партнерства и регуляторные изменения в AI\n"
-        "- инфраструктура/агенты/инструменты, влияющие на разработчиков и бизнес\n"
-        "Низкая важность:\n"
-        "- реклама курсов, вакансии, промо, личные мнения без фактов\n"
-        "- развлекательный контент без новостной ценности\n"
-        "Никакого markdown, только валидный JSON."
+        "is_alert_worthy: boolean\n\n"
+        f"Используй только эти хештеги: {', '.join(NEWS_TAGS)}\n\n"
+        "Правила классификации (строго соблюдай):\n"
+        "- product: ТОЛЬКО кейсы успеха с цифрами — кто-то создал продукт/сервис и есть доказанный результат. Примеры: «стартап за неделю набрал N пользователей», «сервис купили (Google/другая компания)», «внедрили и сэкономили X% / Y млн», «выручка Z», «N компаний уже используют». Без цифр успеха/трафика/экзита — НЕ product. Любой анонс вида «компания X выпустила модель/агента/API» — это tech_update, даже если это «запустили в preview» или «доступен подписчикам».\n"
+        "- tech_update: всё, что «вышло» или «можно юзать», без истории успеха продукта. ВСЕГДА сюда: релизы моделей (GLM-4.7, Gemini, GPT, Claude, Llama), анонсы агентов (Claude Cowork и т.д.), новые API, preview от вендоров, новые версии библиотек/SDK, гайды, документация, best practices, licensing/pricing. Формулировки «X выпустила Y», «запустили в preview», «доступен в API» — tech_update, не product.\n"
+        "- trend: крупный рыночный сдвиг, который может изменить продуктовую стратегию.\n"
+        "- research: результат исследований, который можно применить в продукте в обозримом горизонте.\n"
+        "- industry_report: отчеты McKinsey/BCG/Gartner/Deloitte/фондов с цифрами и практическими выводами.\n"
+        "- misc: все остальное.\n\n"
+        "Критерии implementable_by_small_team=true:\n"
+        "- решение можно повторить командой 3-7 человек за 2-8 недель;\n"
+        "- не требуется обучение frontier-моделей, собственные дата-центры и многомиллионный capex;\n"
+        "- опора на доступные API/opensource/стандартный cloud stack.\n\n"
+        "Критерии infra_barrier:\n"
+        "- low: можно собрать из готовых API/инструментов;\n"
+        "- medium: требуется сложная интеграция и продвинутая MLOps;\n"
+        "- high: нужна тяжелая инфраструктура, уникальные данные, крупный капитал.\n\n"
+        "Критерии high priority:\n"
+        "- для product: только при наличии цифр успеха (пользователи, выручка, экзит, кейс с метриками);\n"
+        "- подтвержденные кейсы внедрения с влиянием на бизнес-метрики (выручка, конверсия, CAC, удержание, cost/time savings);\n"
+        "- изменения платформ/регуляторики, которые прямо влияют на roadmap CoreAI.\n"
+        "- НЕ high priority: «компания X внедрила AI» без цифр; жалобы пользователей на тон/поведение бота; рутинный релиз модели (MiniMax, Llama и т.д.) — это tech_update с priority medium/low.\n\n"
+        "Критерии low priority:\n"
+        "- абстрактные рассуждения без данных;\n"
+        "- реклама, вакансии, курсы, общие IT-статьи без AI-продуктового угла;\n"
+        "- локальные новости без масштабируемого урока.\n\n"
+        "ЧТО НЕ СЧИТАТЬ PRODUCT И НЕ АЛЕРТИТЬ (строго):\n"
+        "- «Компания X говорит, что их разработчики не пишут код благодаря AI» / «внедрили внутренние AI-решения» без цифр (экономия %, сроки, объём) — это не product, это внутренний PR. Классифицируй как misc или trend, priority=low, is_alert_worthy=false.\n"
+        "- Жалобы пользователей на тон/поведение ChatGPT/другого ассистента («конденсцендирующие ответы», «анализируют мотивы») — это не product, не кейс успеха. Классифицируй как misc, priority=low, is_alert_worthy=false.\n"
+        "- Релиз модели с открытыми весами (MiniMax M2.5, Llama, GLM и т.д.) — всегда tech_update, не product. priority для tech_update может быть high только при реально критичном изменении рынка; иначе medium/low. Не раздувай coreai_score и is_alert_worthy для рутинных релизов.\n"
+        "- Любое «абстрактное нечто», которое невозможно реализовать или проверить (общие рассуждения, чужие мнения без кейса, новости без конкретного action_item) — misc, priority=low, is_alert_worthy=false.\n\n"
+        "Важно: (1) «Компания X выпустила/запустила модель/агента/API» — всегда tech_update, не product. (2) product = только когда в новости есть история успеха: цифры пользователей, выручка, экзит, кейс внедрения с метриками. Без этого — tech_update или misc. (3) В «Важную новость» для CoreAI только реально важное: кейсы успеха продукта с цифрами или критичные изменения платформ/регуляторики. Не постить внутренние PR, жалобы пользователей, рутинные релизы моделей.\n\n"
+        "Правило для is_alert_worthy=true:\n"
+        "- только если новость high priority ИЛИ coreai_score >= 0.78;\n"
+        "- для product: только при наличии цифр успеха (пользователи, выручка, экзит, кейс с метриками). Без цифр — is_alert_worthy=false.\n"
+        "- для tech_update: true только при действительно критичном релизе/изменении, не для каждого анонса модели.\n"
+        "- внутренний PR («компания внедрила AI» без метрик), жалобы пользователей, абстрактные рассуждения — всегда is_alert_worthy=false.\n"
+        "- у новости должен быть четкий, реализуемый вывод для продуктового решения CoreAI.\n\n"
+        "Правило для analogs:\n"
+        "- включай только реально релевантные продукты/компании;\n"
+        "- не более 3;\n"
+        "- если аналогов нет, верни пустой массив.\n\n"
+        "Правило для action_item:\n"
+        "- одно действие, которое можно выполнить за 1-2 недели;\n"
+        "- конкретно и проверяемо (например: сравнить X с нашим Y и запустить пилот на Z).\n\n"
+        "Никакого markdown. Никакого текста вне JSON."
     )
 
     try:
@@ -161,8 +202,16 @@ async def analyze_post(content: str) -> dict:
 
         coreai_reason = str(data.get("coreai_reason", "")).strip()
         news_kind = str(data.get("news_kind", "misc")).strip().lower()
-        if news_kind not in {"product", "trend", "research", "misc"}:
+        if news_kind not in {"product", "trend", "research", "tech_update", "industry_report", "misc"}:
             news_kind = "misc"
+        raw_impl = data.get("implementable_by_small_team", False)
+        if isinstance(raw_impl, bool):
+            implementable_by_small_team = raw_impl
+        else:
+            implementable_by_small_team = str(raw_impl).strip().lower() in {"true", "yes", "1"}
+        infra_barrier = str(data.get("infra_barrier", "high")).strip().lower()
+        if infra_barrier not in {"low", "medium", "high"}:
+            infra_barrier = "high"
         try:
             product_score = float(data.get("product_score", 0.0))
         except Exception:
@@ -176,6 +225,15 @@ async def analyze_post(content: str) -> dict:
             is_alert_worthy = raw_alert
         else:
             is_alert_worthy = str(raw_alert).strip().lower() in {"true", "yes", "1"}
+        raw_analogs = data.get("analogs", [])
+        if isinstance(raw_analogs, str):
+            raw_analogs = [a.strip() for a in raw_analogs.split(",") if a.strip()]
+        elif not isinstance(raw_analogs, list):
+            raw_analogs = []
+        analogs = [str(a).strip() for a in raw_analogs if str(a).strip()][:3]
+        action_item = str(data.get("action_item", "")).strip()
+        if not action_item and news_kind == "product":
+            action_item = "Сравнить фичу с нашим roadmap и запланировать эксперимент."
         raw_tags = data.get("tags", [])
         if isinstance(raw_tags, str):
             raw_tags = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
@@ -193,9 +251,13 @@ async def analyze_post(content: str) -> dict:
             "coreai_reason": coreai_reason,
             "tags": tags,
             "news_kind": news_kind,
+            "implementable_by_small_team": implementable_by_small_team,
+            "infra_barrier": infra_barrier,
             "product_score": product_score,
             "priority": priority,
             "is_alert_worthy": is_alert_worthy,
+            "analogs": analogs,
+            "action_item": action_item,
         }
     except Exception as e:
         logger.error(f"LLM combined analysis error: {e}")
@@ -207,10 +269,50 @@ async def analyze_post(content: str) -> dict:
             "coreai_reason": "LLM error fallback",
             "tags": ["#AIТехнологии"],
             "news_kind": "misc",
+            "implementable_by_small_team": False,
+            "infra_barrier": "high",
             "product_score": 0.0,
             "priority": "low",
             "is_alert_worthy": False,
+            "analogs": [],
+            "action_item": "",
         }
+
+
+async def score_user_prompt_relevance(summary: str, user_prompt: str) -> float:
+    """Score how relevant a news summary is to the user custom prompt (0..1)."""
+    if not user_prompt or len(user_prompt.strip()) < 5:
+        return 0.5
+
+    client = get_llm_client()
+    prompt = (
+        "Ты фильтр персонализации новостей.\n"
+        "Оцени соответствие новости пользовательскому фильтру.\n"
+        "Верни СТРОГО JSON: {\"user_relevance_score\": number}\n"
+        "Где score от 0 до 1.\n"
+        "0 = не соответствует, 1 = полностью соответствует.\n"
+        "Без markdown и лишнего текста."
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": f"Пользовательский фильтр:\n{user_prompt[:1200]}\n\nНовость:\n{summary[:1500]}",
+                },
+            ],
+            max_tokens=80,
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+        data = _extract_json_object(raw)
+        score = float(data.get("user_relevance_score", 0.5))
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        logger.debug(f"User relevance scoring error: {e}")
+        return 0.5
 
 
 async def check_ai_relevance(text: str) -> bool:

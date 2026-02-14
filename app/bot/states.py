@@ -23,3 +23,4 @@ class AddLinkStates(StatesGroup):
 class SettingsStates(StatesGroup):
     waiting_digest_time = State()
     waiting_timezone = State()
+    waiting_user_prompt = State()

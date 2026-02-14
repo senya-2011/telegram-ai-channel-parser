@@ -6,6 +6,22 @@ from app.bot.bot import create_bot, create_dispatcher
 from app.scheduler.tasks import setup_scheduler
 from app.services.telegram_parser import disconnect_telethon
 
+
+class SuppressCancelledErrorFilter(logging.Filter):
+    """Не логировать CancelledError от планировщика при остановке бота — это ожидаемо."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith("apscheduler") and record.levelno >= logging.ERROR:
+            msg = record.getMessage()
+            if "CancelledError" in msg:
+                return False
+            if record.exc_info and record.exc_info[0] is not None:
+                exc_type_name = getattr(record.exc_info[0], "__name__", "") or str(record.exc_info[0])
+                if "CancelledError" in exc_type_name:
+                    return False
+        return True
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -13,6 +29,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
+logging.getLogger().addFilter(SuppressCancelledErrorFilter())
 
 # Reduce noise from libraries
 logging.getLogger("aiogram").setLevel(logging.WARNING)

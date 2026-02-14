@@ -8,11 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.keyboards import back_to_menu_new_keyboard, digest_keyboard, discovered_sources_keyboard
 from app.db.models import User
 from app.db.repositories import (
+    get_cluster_by_id,
     get_or_create_source,
     get_posts_for_digest,
     get_source_by_id,
     get_user_sources,
     subscribe_user_to_source,
+    upsert_user_feedback,
 )
 from app.services.digest import generate_digest_for_user
 
@@ -71,17 +73,26 @@ def _split_text_smart(text: str, max_len: int = 4000) -> list[str]:
     return chunks if chunks else [text[:max_len]]
 
 
-@router.callback_query(F.data == "menu:digest")
-async def show_digest(callback: CallbackQuery, user: User | None, session: AsyncSession):
+async def _render_digest(
+    callback: CallbackQuery,
+    user: User | None,
+    session: AsyncSession,
+    mode: str = "main",
+):
     if not user:
         await callback.answer("Сначала авторизуйтесь.", show_alert=True)
         return
 
     await callback.answer()
-    await callback.message.edit_text("⏳ Формирую дайджест за сегодня...")
+    mode_title = {
+        "main": "основной",
+        "tech_update": "технологических обновлений",
+        "industry_report": "отчётов и аналитики",
+    }.get(mode, "основной")
+    await callback.message.edit_text(f"⏳ Формирую дайджест ({mode_title})...")
 
     try:
-        digest_text = await generate_digest_for_user(session, user.id)
+        digest_text = await generate_digest_for_user(session, user.id, mode=mode)
         if digest_text:
             chunks = _split_text_smart(digest_text, max_len=4000)
             if len(chunks) == 1:
@@ -109,6 +120,47 @@ async def show_digest(callback: CallbackQuery, user: User | None, session: Async
             "❌ Ошибка при формировании дайджеста. Попробуйте позже.",
             reply_markup=back_to_menu_new_keyboard(),
         )
+
+
+@router.callback_query(F.data == "menu:digest")
+async def show_digest(callback: CallbackQuery, user: User | None, session: AsyncSession):
+    await _render_digest(callback, user, session, mode="main")
+
+
+@router.callback_query(F.data == "menu:digest:tech_update")
+async def show_tech_digest(callback: CallbackQuery, user: User | None, session: AsyncSession):
+    await _render_digest(callback, user, session, mode="tech_update")
+
+
+@router.callback_query(F.data == "menu:digest:industry_report")
+async def show_reports_digest(callback: CallbackQuery, user: User | None, session: AsyncSession):
+    await _render_digest(callback, user, session, mode="industry_report")
+
+
+@router.callback_query(F.data.startswith("feedback:"))
+async def save_feedback(callback: CallbackQuery, user: User | None, session: AsyncSession):
+    if not user:
+        await callback.answer("Сначала авторизуйтесь.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    direction = parts[1]
+    try:
+        cluster_id = int(parts[2])
+    except Exception:
+        await callback.answer("Некорректный cluster_id", show_alert=True)
+        return
+
+    cluster = await get_cluster_by_id(session, cluster_id)
+    if not cluster:
+        await callback.answer("Новость не найдена", show_alert=True)
+        return
+
+    vote = 1 if direction == "up" else -1
+    await upsert_user_feedback(session, user.id, cluster_id, vote=vote)
+    await callback.answer("✅ Учтено, подстрою ленту под вас")
 
 
 @router.callback_query(F.data == "discover:sources")

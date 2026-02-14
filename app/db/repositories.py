@@ -12,6 +12,7 @@ from app.db.models import (
     Post,
     Source,
     User,
+    UserNewsFeedback,
     UserSettings,
     UserSource,
     UserTelegramLink,
@@ -73,6 +74,9 @@ async def update_user_settings(
     user_id: int,
     digest_time: Optional[str] = None,
     timezone: Optional[str] = None,
+    include_tech_updates: Optional[bool] = None,
+    include_industry_reports: Optional[bool] = None,
+    user_prompt: Optional[str] = None,
 ) -> UserSettings:
     result = await session.execute(select(UserSettings).where(UserSettings.user_id == user_id))
     user_settings = result.scalar_one_or_none()
@@ -83,6 +87,12 @@ async def update_user_settings(
         user_settings.digest_time = digest_time
     if timezone is not None:
         user_settings.timezone = timezone
+    if include_tech_updates is not None:
+        user_settings.include_tech_updates = include_tech_updates
+    if include_industry_reports is not None:
+        user_settings.include_industry_reports = include_industry_reports
+    if user_prompt is not None:
+        user_settings.user_prompt = user_prompt
     await session.commit()
     return user_settings
 
@@ -231,6 +241,32 @@ async def get_unprocessed_posts(session: AsyncSession, limit: int = 50) -> Seque
     return result.scalars().all()
 
 
+async def delete_old_orphan_posts(
+    session: AsyncSession,
+    older_than_days: int = 7,
+    limit: int = 500,
+) -> int:
+    """
+    Удаляет посты, которые не вошли ни в один кластер (не продукт/технология/анализ)
+    и старше older_than_days. Ограничение limit за один вызов, чтобы не блокировать БД.
+    Возвращает количество удалённых строк.
+    """
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=older_than_days)
+    subq = (
+        select(Post.id)
+        .where(Post.cluster_id.is_(None), Post.parsed_at < cutoff)
+        .order_by(Post.parsed_at.asc())
+        .limit(limit)
+    )
+    result = await session.execute(subq)
+    ids = [row[0] for row in result.all()]
+    if not ids:
+        return 0
+    await session.execute(delete(Post).where(Post.id.in_(ids)))
+    await session.commit()
+    return len(ids)
+
+
 async def get_recent_post_by_hash(
     session: AsyncSession,
     normalized_hash: str,
@@ -339,6 +375,13 @@ def _merge_tags(existing: str, incoming: list[str] | None) -> str:
     return ",".join(sorted(tags))
 
 
+def _merge_analogs(existing: str, incoming: list[str] | None) -> str:
+    analogs = {item.strip() for item in (existing or "").split(",") if item.strip()}
+    if incoming:
+        analogs.update(item.strip() for item in incoming if item and item.strip())
+    return ",".join(sorted(analogs))
+
+
 def _priority_rank(priority: str) -> int:
     mapping = {"low": 1, "medium": 2, "high": 3}
     return mapping.get((priority or "low").lower(), 1)
@@ -368,9 +411,13 @@ async def create_news_cluster(
     coreai_reason: str = "",
     tags: list[str] | None = None,
     news_kind: str = "misc",
+    implementable_by_small_team: bool = False,
+    infra_barrier: str = "high",
     product_score: float = 0.0,
     priority: str = "low",
     is_alert_worthy: bool = False,
+    analogs: list[str] | None = None,
+    action_item: str = "",
 ) -> NewsCluster:
     cluster = NewsCluster(
         canonical_hash=canonical_hash,
@@ -383,7 +430,11 @@ async def create_news_cluster(
         coreai_score=coreai_score,
         coreai_reason=coreai_reason,
         tags=_merge_tags("", tags),
+        analogs=_merge_analogs("", analogs),
+        action_item=action_item or None,
         news_kind=news_kind,
+        implementable_by_small_team=implementable_by_small_team,
+        infra_barrier=infra_barrier,
         product_score=product_score,
         priority=priority,
         is_alert_worthy=is_alert_worthy,
@@ -408,9 +459,13 @@ async def attach_post_to_cluster(
     is_ai_relevant: Optional[bool] = None,
     tags: list[str] | None = None,
     news_kind: Optional[str] = None,
+    implementable_by_small_team: Optional[bool] = None,
+    infra_barrier: Optional[str] = None,
     product_score: Optional[float] = None,
     priority: Optional[str] = None,
     is_alert_worthy: Optional[bool] = None,
+    analogs: list[str] | None = None,
+    action_item: Optional[str] = None,
     commit: bool = True,
 ) -> None:
     post.cluster_id = cluster.id
@@ -425,11 +480,23 @@ async def attach_post_to_cluster(
     cluster.mention_count = (cluster.mention_count or 0) + 1
     cluster.source_ids = _merge_source_ids(cluster.source_ids or "", post.source_id)
     cluster.tags = _merge_tags(cluster.tags or "", tags)
+    cluster.analogs = _merge_analogs(cluster.analogs or "", analogs)
+    if action_item and _priority_rank(priority or cluster.priority) >= _priority_rank(cluster.priority):
+        cluster.action_item = action_item
     if product_score is not None:
         cluster.product_score = max(float(cluster.product_score or 0.0), float(product_score))
     if news_kind:
-        if cluster.news_kind != "product" or news_kind == "product":
+        if cluster.news_kind not in {"product", "tech_update", "industry_report"} or news_kind in {"product", "tech_update", "industry_report"}:
             cluster.news_kind = news_kind
+    if implementable_by_small_team is not None:
+        cluster.implementable_by_small_team = bool(
+            cluster.implementable_by_small_team or implementable_by_small_team
+        )
+    if infra_barrier in {"low", "medium", "high"}:
+        rank = {"low": 1, "medium": 2, "high": 3}
+        current = (cluster.infra_barrier or "high").lower()
+        if rank.get(infra_barrier, 3) < rank.get(current, 3):
+            cluster.infra_barrier = infra_barrier
     if priority and _priority_rank(priority) > _priority_rank(cluster.priority):
         cluster.priority = priority
     if is_alert_worthy is not None:
@@ -493,7 +560,7 @@ async def get_pending_important_clusters_for_alerts(
             (
                 (NewsCluster.coreai_score >= min_core_score)
                 | (
-                    (NewsCluster.news_kind == "product")
+                    (NewsCluster.news_kind.in_(["product", "tech_update"]))
                     & (NewsCluster.product_score >= min_product_score)
                     & (NewsCluster.priority.in_(["high", "medium"]))
                 )
@@ -595,8 +662,15 @@ async def create_alert(
     post_id: int,
     alert_type: str,
     reason: str,
+    user_relevance_score: Optional[float] = None,
 ) -> Alert:
-    alert = Alert(user_id=user_id, post_id=post_id, alert_type=alert_type, reason=reason)
+    alert = Alert(
+        user_id=user_id,
+        post_id=post_id,
+        alert_type=alert_type,
+        reason=reason,
+        user_relevance_score=user_relevance_score,
+    )
     session.add(alert)
     await session.commit()
     return alert
@@ -654,3 +728,50 @@ async def get_all_users_with_settings(session: AsyncSession) -> Sequence[User]:
         select(User).join(UserSettings, User.id == UserSettings.user_id)
     )
     return result.scalars().all()
+
+
+async def upsert_user_feedback(
+    session: AsyncSession,
+    user_id: int,
+    cluster_id: int,
+    vote: int,
+) -> UserNewsFeedback:
+    vote = 1 if vote >= 1 else -1
+    result = await session.execute(
+        select(UserNewsFeedback).where(
+            UserNewsFeedback.user_id == user_id,
+            UserNewsFeedback.cluster_id == cluster_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row:
+        row.vote = vote
+        await session.commit()
+        return row
+    row = UserNewsFeedback(user_id=user_id, cluster_id=cluster_id, vote=vote)
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def get_user_kind_feedback_bias(session: AsyncSession, user_id: int) -> dict[str, float]:
+    result = await session.execute(
+        select(NewsCluster.news_kind, func.avg(UserNewsFeedback.vote))
+        .join(NewsCluster, NewsCluster.id == UserNewsFeedback.cluster_id)
+        .where(UserNewsFeedback.user_id == user_id)
+        .group_by(NewsCluster.news_kind)
+    )
+    return {kind: float(score) for kind, score in result.all()}
+
+
+async def get_user_disliked_clusters(session: AsyncSession, user_id: int) -> Sequence[NewsCluster]:
+    """Кластеры, которые пользователь отметил «Мимо». Для фильтра «не показывать похожее»."""
+    result = await session.execute(
+        select(NewsCluster)
+        .join(UserNewsFeedback, UserNewsFeedback.cluster_id == NewsCluster.id)
+        .where(
+            UserNewsFeedback.user_id == user_id,
+            UserNewsFeedback.vote == -1,
+        )
+    )
+    return result.scalars().unique().all()

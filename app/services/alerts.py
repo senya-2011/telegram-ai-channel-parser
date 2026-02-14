@@ -25,11 +25,18 @@ from app.db.repositories import (
     get_telegram_ids_for_user,
     get_unprocessed_posts,
     get_clusters_for_popularity_updates,
+    get_user_disliked_clusters,
+    get_user_settings,
     mark_cluster_popularity_notified,
     mark_cluster_alert_sent,
 )
 from app.services.embedding import cosine_similarity, generate_embedding
-from app.services.llm_client import analyze_business_impact, analyze_post, check_similarity
+from app.services.llm_client import (
+    analyze_business_impact,
+    analyze_post,
+    check_similarity,
+    score_user_prompt_relevance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +48,15 @@ _NOISE_PATTERNS = (
 )
 
 _AI_PREFILTER = (
-    "ai", "ml", "llm", "gpt", "openai", "deepseek", "anthropic", "gemini", "claude",
-    "нейросет", "искусствен", "машинн обучен", "ии", "модель", "агент",
+    "openai", "deepseek", "anthropic", "gemini", "claude",
+    "нейросет", "искусствен", "машинн обучен", "модель", "агент",
+)
+_AI_PREFILTER_REGEX = (
+    r"\bai\b",
+    r"\bml\b",
+    r"\bllm\b",
+    r"\bgpt(?:[-\w\d]+)?\b",
+    r"\bии\b",
 )
 
 
@@ -89,7 +103,9 @@ def _get_post_link(source, post) -> str:
 
 def _quick_prefilter(text: str) -> bool:
     text_lower = text.lower()
-    return any(token in text_lower for token in _AI_PREFILTER)
+    if any(token in text_lower for token in _AI_PREFILTER):
+        return True
+    return any(re.search(pattern, text_lower, flags=re.IGNORECASE) for pattern in _AI_PREFILTER_REGEX)
 
 
 def _priority_rank(priority: str) -> int:
@@ -171,9 +187,13 @@ async def _analyze_and_cluster_post(
     coreai_reason = analysis.get("coreai_reason", "")
     tags = analysis.get("tags", [])
     news_kind = analysis.get("news_kind", "misc")
+    implementable_by_small_team = bool(analysis.get("implementable_by_small_team", False))
+    infra_barrier = str(analysis.get("infra_barrier", "high"))
     product_score = float(analysis.get("product_score", 0.0))
     priority = analysis.get("priority", "low")
     is_alert_worthy = bool(analysis.get("is_alert_worthy", False))
+    analogs = analysis.get("analogs", [])
+    action_item = analysis.get("action_item", "")
 
     post.summary = summary
     post.normalized_hash = normalized_hash
@@ -197,9 +217,13 @@ async def _analyze_and_cluster_post(
             is_ai_relevant=True,
             tags=tags,
             news_kind=news_kind,
+            implementable_by_small_team=implementable_by_small_team,
+            infra_barrier=infra_barrier,
             product_score=product_score,
             priority=priority,
             is_alert_worthy=is_alert_worthy,
+            analogs=analogs,
+            action_item=action_item,
             commit=False,
         )
         await session.commit()
@@ -217,9 +241,13 @@ async def _analyze_and_cluster_post(
         coreai_reason=coreai_reason,
         tags=tags,
         news_kind=news_kind,
+        implementable_by_small_team=implementable_by_small_team,
+        infra_barrier=infra_barrier,
         product_score=product_score,
         priority=priority,
         is_alert_worthy=is_alert_worthy,
+        analogs=analogs,
+        action_item=action_item,
     )
     post.cluster_id = cluster.id
     await session.commit()
@@ -297,9 +325,19 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
         c for c in pending
         if c.news_kind == "product"
         and c.product_score >= settings.min_product_score_for_alert
+        and (c.implementable_by_small_team or c.infra_barrier in {"low", "medium"})
         and (c.is_alert_worthy or c.priority in {"high", "medium"})
     ]
-    products.sort(key=lambda c: (_priority_rank(c.priority), c.product_score, c.mention_count), reverse=True)
+    products.sort(
+        key=lambda c: (
+            _priority_rank(c.priority),
+            c.implementable_by_small_team,
+            -({"low": 1, "medium": 2, "high": 3}.get(c.infra_barrier or "high", 3)),
+            c.product_score,
+            c.mention_count,
+        ),
+        reverse=True,
+    )
 
     trends = [
         c for c in pending
@@ -317,9 +355,30 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
     ]
     research.sort(key=lambda c: (c.coreai_score, c.mention_count), reverse=True)
 
+    tech_updates = [
+        c for c in pending
+        if c.news_kind == "tech_update"
+        and c.is_alert_worthy
+        and c.product_score >= (settings.min_product_score_for_alert - 0.1)
+    ]
+    tech_updates.sort(
+        key=lambda c: (_priority_rank(c.priority), c.implementable_by_small_team, c.product_score),
+        reverse=True,
+    )
+
+    reports = [
+        c for c in pending
+        if c.news_kind == "industry_report"
+        and c.is_alert_worthy
+        and c.coreai_score >= settings.min_non_product_core_score_for_alert
+    ]
+    reports.sort(key=lambda c: (c.coreai_score, c.mention_count), reverse=True)
+
     selected = products[:20]
     selected.extend(trends[: settings.trend_alerts_per_cycle])
     selected.extend(research[: settings.research_alerts_per_cycle])
+    selected.extend(tech_updates[:1])
+    selected.extend(reports[:1])
 
     important = list(
         await get_pending_important_clusters_for_alerts(
@@ -341,8 +400,16 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
 
     business_cache: dict[int, dict] = {}
 
+    def _implementable_or_low_barrier(c: NewsCluster) -> bool:
+        return c.implementable_by_small_team or (c.infra_barrier or "high") in {"low", "medium"}
+
     for cluster in filtered:
+        # Основной алерт «похожая новость в нескольких источниках» — только полезное: реализуемо малой командой или низкий/средний барьер
+        if not _implementable_or_low_barrier(cluster):
+            continue
         try:
+            # Сразу помечаем кластер как отправленный, чтобы вторая задача (telegram/web) не отправила его повторно
+            await mark_cluster_alert_sent(session, cluster.id)
             business_insight = await _build_business_impact_block(cluster, business_cache)
             alert_type = "important" if (
                 cluster.coreai_score >= settings.important_alert_core_score
@@ -360,7 +427,6 @@ async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
                 alert_type=alert_type,
                 business_insight=business_insight,
             )
-            await mark_cluster_alert_sent(session, cluster.id)
         except Exception as e:
             logger.error(f"Error sending cluster alert {cluster.id}: {e}")
 
@@ -427,8 +493,13 @@ async def _send_cluster_popularity_message(
             users.append(user)
 
     for user in users:
-        await create_alert(session, user.id, representative_post.id, "trend", reason)
-        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
+        user_settings = await get_user_settings(session, user.id)
+        if cluster.news_kind == "tech_update" and not getattr(user_settings, "include_tech_updates", False):
+            continue
+        if cluster.news_kind == "industry_report" and not getattr(user_settings, "include_industry_reports", False):
+            continue
+        await create_alert(session, user.id, representative_post.id, "trend", reason, user_relevance_score=0.5)
+        await _send_alert_to_user(bot, session, user.id, reason, topic=topic, cluster_id=cluster.id)
 
 
 async def _send_similarity_alert_for_cluster(
@@ -480,7 +551,11 @@ async def _send_similarity_alert_for_cluster(
         f"{header}\n\n"
         f"📰 <b>Суть:</b> {cluster.canonical_summary[:260]}\n"
         f"🧭 <b>Тип:</b> {cluster.news_kind} | priority: {cluster.priority}\n"
+        f"🛠 <b>Реализуемо маленькой командой:</b> {'да' if cluster.implementable_by_small_team else 'нет'}\n"
+        f"🏗 <b>Инфра-барьер:</b> {cluster.infra_barrier}\n"
         f"🏷 <b>Теги:</b> {tags_text}\n"
+        f"🧩 <b>Аналоги:</b> {cluster.analogs if cluster.analogs else 'нет явных аналогов'}\n"
+        f"✅ <b>Action:</b> {cluster.action_item or 'Зафиксировать в backlog и проверить конкурентные фичи'}\n"
         f"📡 <b>Источников:</b> {cluster.mention_count}\n"
         f"{coreai_line}"
         f"{business_insight.get('block', '') if business_insight else ''}"
@@ -496,9 +571,78 @@ async def _send_similarity_alert_for_cluster(
             seen_user_ids.add(user.id)
             all_users.append(user)
 
+    # Эмбеддинг текущего кластера для проверки «похоже на то, что юзер отметил Мимо»
+    def _usable_emb(emb):
+        if emb is None:
+            return False
+        try:
+            return len(emb) > 0
+        except (TypeError, AttributeError):
+            return False
+
+    raw_current = getattr(cluster, "embedding", None)
+    current_embedding = raw_current if _usable_emb(raw_current) else None
+    if not _usable_emb(current_embedding) and cluster.canonical_summary:
+        current_embedding = generate_embedding(cluster.canonical_summary[:2000])
+    dislike_similarity_threshold = settings.feedback_dislike_similarity_threshold
+
+    settings_cache: dict[int, object] = {}
     for user in all_users:
-        await create_alert(session, user.id, representative_post.id, alert_type, reason)
-        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
+        if user.id not in settings_cache:
+            settings_cache[user.id] = await get_user_settings(session, user.id)
+        user_settings = settings_cache[user.id]
+
+        if cluster.news_kind == "tech_update" and not getattr(user_settings, "include_tech_updates", False):
+            continue
+        if cluster.news_kind == "industry_report" and not getattr(user_settings, "include_industry_reports", False):
+            continue
+
+        # Не слать алерт, если кластер похож на то, что пользователь отметил «Мимо» (по смыслу, не по типу)
+        if _usable_emb(current_embedding) and dislike_similarity_threshold < 1.0:
+            disliked = await get_user_disliked_clusters(session, user.id)
+            skip_user = False
+            for dc in disliked:
+                raw_dc = getattr(dc, "embedding", None)
+                dc_emb = raw_dc if _usable_emb(raw_dc) else (
+                    generate_embedding(dc.canonical_summary[:2000]) if dc.canonical_summary else None
+                )
+                if _usable_emb(dc_emb) and cosine_similarity(current_embedding, dc_emb) >= dislike_similarity_threshold:
+                    skip_user = True
+                    break
+            if skip_user:
+                continue
+
+        user_prompt = (getattr(user_settings, "user_prompt", "") or "").strip()
+        user_relevance_score = 0.5
+        if user_prompt:
+            user_relevance_score = await score_user_prompt_relevance(cluster.canonical_summary, user_prompt)
+
+        personalized_score = (
+            cluster.coreai_score * 0.55
+            + cluster.product_score * 0.3
+            + user_relevance_score * 0.15
+            + (0.08 if cluster.implementable_by_small_team else 0.0)
+            - (0.1 if cluster.infra_barrier == "high" else 0.0)
+        )
+        if personalized_score < 0.50 and alert_type != "important":
+            continue
+
+        await create_alert(
+            session,
+            user.id,
+            representative_post.id,
+            alert_type,
+            reason,
+            user_relevance_score=user_relevance_score,
+        )
+        await _send_alert_to_user(
+            bot,
+            session,
+            user.id,
+            reason,
+            topic=topic,
+            cluster_id=cluster.id,
+        )
 
 
 async def _send_reactions_alert(
@@ -529,14 +673,28 @@ async def _send_reactions_alert(
     topic = (post.summary or post.content)[:100]
     subscribers = await get_subscribers_for_source(session, post.source_id)
     for user in subscribers:
-        await create_alert(session, user.id, post.id, "reactions", reason)
-        await _send_alert_to_user(bot, session, user.id, reason, topic=topic)
+        await create_alert(session, user.id, post.id, "reactions", reason, user_relevance_score=0.5)
+        await _send_alert_to_user(
+            bot,
+            session,
+            user.id,
+            reason,
+            topic=topic,
+            cluster_id=post.cluster_id,
+        )
 
 
-async def _send_alert_to_user(bot: Bot, session: AsyncSession, user_id: int, text: str, topic: str = ""):
+async def _send_alert_to_user(
+    bot: Bot,
+    session: AsyncSession,
+    user_id: int,
+    text: str,
+    topic: str = "",
+    cluster_id: int | None = None,
+):
     from app.bot.keyboards import alert_keyboard
 
-    keyboard = alert_keyboard(topic) if topic else None
+    keyboard = alert_keyboard(topic, cluster_id=cluster_id) if topic else None
     telegram_ids = await get_telegram_ids_for_user(session, user_id)
     for tg_id in telegram_ids:
         try:

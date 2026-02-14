@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     digest_target_items: int = 10
     digest_product_share: float = 0.75
     digest_max_non_product: int = 3
+    user_prompt_min_score: float = 0.45
+    feedback_dislike_similarity_threshold: float = 0.82  # не алертить/не дайджестить кластеры, похожие на «Мимо»
+    strict_product_prefilter: bool = True
+    drop_misc_posts: bool = True
+    min_core_score_to_keep_non_product: float = 0.78
+    min_product_score_to_keep: float = 0.55
+    prune_irrelevant_posts: bool = True
+    irrelevant_post_retention_days: int = 7
+    prune_irrelevant_limit: int = 500
 
     # Tavily (web search for discovering new sources)
     tavily_api_key: str = ""

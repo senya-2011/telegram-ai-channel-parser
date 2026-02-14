@@ -21,6 +21,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📡 Мои каналы", callback_data="menu:channels")],
         [InlineKeyboardButton(text="🔗 Мои ссылки", callback_data="menu:links")],
         [InlineKeyboardButton(text="📰 Дайджест за сегодня", callback_data="menu:digest")],
+        [InlineKeyboardButton(text="🧱 Обновления технологий", callback_data="menu:digest:tech_update")],
+        [InlineKeyboardButton(text="📊 Отчёты и аналитика", callback_data="menu:digest:industry_report")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
     ])
 
@@ -56,6 +58,9 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🕐 Время дайджеста", callback_data="settings:digest_time")],
         [InlineKeyboardButton(text="🌍 Часовой пояс", callback_data="settings:timezone")],
+        [InlineKeyboardButton(text="🧱 Tech updates: ON/OFF", callback_data="settings:toggle_tech_updates")],
+        [InlineKeyboardButton(text="📊 Reports: ON/OFF", callback_data="settings:toggle_reports")],
+        [InlineKeyboardButton(text="🎯 Персональный prompt", callback_data="settings:user_prompt")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
     ])
 
@@ -82,19 +87,29 @@ def back_to_menu_new_keyboard() -> InlineKeyboardMarkup:
 
 def digest_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📰 Основной дайджест", callback_data="menu:digest")],
+        [InlineKeyboardButton(text="🧱 Tech updates", callback_data="menu:digest:tech_update")],
+        [InlineKeyboardButton(text="📊 Отчёты", callback_data="menu:digest:industry_report")],
         [InlineKeyboardButton(text="🔍 Найти ещё источники", callback_data="discover:sources")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")],
     ])
 
 
-def alert_keyboard(alert_topic: str) -> InlineKeyboardMarkup:
+def alert_keyboard(alert_topic: str, cluster_id: int | None = None) -> InlineKeyboardMarkup:
     """Keyboard under alerts — search for more about this topic."""
     # Encode topic in callback data (truncate to fit Telegram's 64-byte limit)
     topic_short = alert_topic[:40]
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = []
+    if cluster_id:
+        rows.append([
+            InlineKeyboardButton(text="👍 Релевантно", callback_data=f"feedback:up:{cluster_id}"),
+            InlineKeyboardButton(text="👎 Мимо", callback_data=f"feedback:down:{cluster_id}"),
+        ])
+    rows.extend([
         [InlineKeyboardButton(text="🔍 Найти ещё про это", callback_data=f"alertsrc:{hash(topic_short) % 100000}")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:new")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def discovered_sources_keyboard(sources: list[dict]) -> InlineKeyboardMarkup:
