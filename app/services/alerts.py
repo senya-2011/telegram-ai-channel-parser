@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import re
@@ -39,6 +40,9 @@ from app.services.llm_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Только одна задача (telegram или web) рассылает алерты за раз — иначе один кластер уходит дважды
+_cluster_alerts_lock = asyncio.Lock()
 
 _NOISE_PATTERNS = (
     r"https?://\S+",
@@ -313,6 +317,11 @@ async def _match_cluster(
 
 
 async def _send_cluster_alerts(session: AsyncSession, bot: Bot) -> None:
+    async with _cluster_alerts_lock:
+        await _send_cluster_alerts_impl(session, bot)
+
+
+async def _send_cluster_alerts_impl(session: AsyncSession, bot: Bot) -> None:
     pending = list(await get_pending_clusters_for_alerts(
         session,
         min_mentions=settings.cluster_min_mentions,
