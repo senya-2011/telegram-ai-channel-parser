@@ -458,7 +458,7 @@ async def generate_digest_for_user(
 
         # Deterministic per-news section with inline tags (LLM output may reorder/omit markers).
         per_news_section = "\n\n🧷 <b>Новости по источникам:</b>\n"
-        for i, s in enumerate(summaries[:6], 1):
+        for i, s in enumerate(summaries[:10], 1):
             mentions_text = f" | 📈 {s['mentions']} источн." if s.get("mentions", 1) >= 2 else ""
             short_summary = _trim_text(s["summary"] or "", 120)
             link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s.get("link") else ""
