@@ -241,6 +241,7 @@ async def generate_digest_for_user(
     research_posts = []
     tech_posts_fallback = []   # tech_update по типу, без жёсткого отбора по качеству
     report_posts_fallback = []
+    main_posts_fallback = []   # product/tech/trend/research для основного дайджеста без жёсткого отбора
     for post in unique_posts:
         cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
         kind = cluster.news_kind if cluster else "misc"
@@ -248,6 +249,8 @@ async def generate_digest_for_user(
             tech_posts_fallback.append(post)
         if kind == "industry_report":
             report_posts_fallback.append(post)
+        if kind == "product":
+            main_posts_fallback.append(post)
         if not _is_digest_candidate(cluster):
             continue
         if mode == "tech_update" and kind != "tech_update":
@@ -275,9 +278,8 @@ async def generate_digest_for_user(
     elif mode == "industry_report":
         selected_posts = report_posts[:target_items]
     else:
-        selected_posts = product_posts[:product_target]
-        non_product = tech_posts + report_posts + trend_posts + research_posts
-        selected_posts.extend(non_product[:non_product_cap])
+        # Основной дайджест — только продукты
+        selected_posts = product_posts[:target_items]
     if len(selected_posts) < target_items:
         already = {p.id for p in selected_posts}
         for post in unique_posts:
@@ -291,11 +293,8 @@ async def generate_digest_for_user(
                 continue
             if mode == "industry_report" and kind != "industry_report":
                 continue
-            if mode == "main":
-                if kind == "tech_update" and not include_tech:
-                    continue
-                if kind == "industry_report" and not include_reports:
-                    continue
+            if mode == "main" and kind != "product":
+                continue
             selected_posts.append(post)
             if len(selected_posts) >= target_items:
                 break
@@ -337,7 +336,11 @@ async def generate_digest_for_user(
             action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
 
         user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
-        if user_prompt and user_relevance_score < settings.user_prompt_min_score and mode == "main":
+        # Фильтр по релевантности — только если промпт похож на фильтр (напр. «Показывай только B2B»), не на инструкцию по формату («Пиши на английском»)
+        _is_format_instruction = user_prompt and any(
+            kw in user_prompt.lower() for kw in ("пиши", "добавляй", "всегда", "еще", "ещё", "на английском", "на русском", "формат", "дополни")
+        )
+        if user_prompt and not _is_format_instruction and user_relevance_score < settings.user_prompt_min_score and mode == "main":
             continue
 
         summaries.append({
@@ -353,78 +356,80 @@ async def generate_digest_for_user(
             "product_score": product_score,
             "coreai_score": coreai_score,
             "user_relevance_score": user_relevance_score,
+            "post_id": post.id,
         })
 
+    async def _append_summary_for_post(post, to_list: list) -> bool:
+        post_text = post.summary or post.content[:300]
+        if not _is_ai(post_text):
+            return False
+        source = await get_source_by_id(session, post.source_id)
+        source_title = source.title or source.identifier if source else "Неизвестный"
+        link = _get_post_link(source, post)
+        cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        mentions = cluster.mention_count if cluster else 1
+        tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
+        analogs_text = cluster.analogs if cluster and cluster.analogs else ""
+        action_item = cluster.action_item if cluster and cluster.action_item else ""
+        news_kind = cluster.news_kind if cluster else "misc"
+        product_score = float(cluster.product_score) if cluster else 0.0
+        coreai_score = float(cluster.coreai_score) if cluster else 0.0
+        if not action_item and news_kind == "product":
+            action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
+        user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
+        to_list.append({
+            "source": source_title,
+            "summary": post_text,
+            "reactions": post.reactions_count,
+            "link": link,
+            "mentions": mentions,
+            "tags": tags_text,
+            "analogs": analogs_text,
+            "action_item": action_item,
+            "news_kind": news_kind,
+            "product_score": product_score,
+            "coreai_score": coreai_score,
+            "user_relevance_score": user_relevance_score,
+            "post_id": post.id,
+        })
+        return True
+
     fallback_used = False
-    if not summaries and mode == "tech_update" and tech_posts_fallback:
-        for post in tech_posts_fallback[:5]:
-            post_text = post.summary or post.content[:300]
-            if not _is_ai(post_text):
+    min_digest_items = 5
+    seen_post_ids = {s.get("post_id") for s in summaries if s.get("post_id") is not None}
+
+    if mode == "main" and len(summaries) < min_digest_items and main_posts_fallback:
+        n_before = len(summaries)
+        for post in main_posts_fallback:
+            if len(summaries) >= min_digest_items:
+                break
+            if post.id in seen_post_ids:
                 continue
-            source = await get_source_by_id(session, post.source_id)
-            source_title = source.title or source.identifier if source else "Неизвестный"
-            link = _get_post_link(source, post)
-            cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
-            mentions = cluster.mention_count if cluster else 1
-            tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
-            analogs_text = cluster.analogs if cluster and cluster.analogs else ""
-            action_item = cluster.action_item if cluster and cluster.action_item else ""
-            news_kind = cluster.news_kind if cluster else "misc"
-            product_score = float(cluster.product_score) if cluster else 0.0
-            coreai_score = float(cluster.coreai_score) if cluster else 0.0
-            if not action_item and news_kind == "product":
-                action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
-            user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
-            summaries.append({
-                "source": source_title,
-                "summary": post_text,
-                "reactions": post.reactions_count,
-                "link": link,
-                "mentions": mentions,
-                "tags": tags_text,
-                "analogs": analogs_text,
-                "action_item": action_item,
-                "news_kind": news_kind,
-                "product_score": product_score,
-                "coreai_score": coreai_score,
-                "user_relevance_score": user_relevance_score,
-            })
-        if summaries:
+            seen_post_ids.add(post.id)
+            await _append_summary_for_post(post, summaries)
+        if len(summaries) > n_before:
             fallback_used = True
-    if not summaries and mode == "industry_report" and report_posts_fallback:
-        for post in report_posts_fallback[:5]:
-            post_text = post.summary or post.content[:300]
-            if not _is_ai(post_text):
+    if mode == "tech_update" and len(summaries) < min_digest_items and tech_posts_fallback:
+        n_before = len(summaries)
+        for post in tech_posts_fallback:
+            if len(summaries) >= min_digest_items:
+                break
+            if post.id in seen_post_ids:
                 continue
-            source = await get_source_by_id(session, post.source_id)
-            source_title = source.title or source.identifier if source else "Неизвестный"
-            link = _get_post_link(source, post)
-            cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
-            mentions = cluster.mention_count if cluster else 1
-            tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
-            analogs_text = cluster.analogs if cluster and cluster.analogs else ""
-            action_item = cluster.action_item if cluster and cluster.action_item else ""
-            news_kind = cluster.news_kind if cluster else "misc"
-            product_score = float(cluster.product_score) if cluster else 0.0
-            coreai_score = float(cluster.coreai_score) if cluster else 0.0
-            if not action_item and news_kind == "product":
-                action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
-            user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
-            summaries.append({
-                "source": source_title,
-                "summary": post_text,
-                "reactions": post.reactions_count,
-                "link": link,
-                "mentions": mentions,
-                "tags": tags_text,
-                "analogs": analogs_text,
-                "action_item": action_item,
-                "news_kind": news_kind,
-                "product_score": product_score,
-                "coreai_score": coreai_score,
-                "user_relevance_score": user_relevance_score,
-            })
-        if summaries:
+            seen_post_ids.add(post.id)
+            await _append_summary_for_post(post, summaries)
+        if len(summaries) > n_before:
+            fallback_used = True
+    if mode == "industry_report" and len(summaries) < min_digest_items and report_posts_fallback:
+        n_before = len(summaries)
+        for post in report_posts_fallback:
+            if len(summaries) >= min_digest_items:
+                break
+            if post.id in seen_post_ids:
+                continue
+            seen_post_ids.add(post.id)
+            await _append_summary_for_post(post, summaries)
+        if len(summaries) > n_before:
             fallback_used = True
 
     if not summaries:
@@ -442,6 +447,9 @@ async def generate_digest_for_user(
     digest_fallback_note = ""
     if fallback_used:
         digest_fallback_note = (
+            "Релевантных продуктовых AI/LLM-новостей высокого качества не нашлось. "
+            "Ниже — подборка за день.\n\n"
+        ) if mode == "main" else (
             "Релевантных технологических обновлений высокого качества не нашлось. "
             "Ниже — подборка по теме за день.\n\n"
         ) if mode == "tech_update" else (
@@ -449,8 +457,8 @@ async def generate_digest_for_user(
             "Ниже — подборка по теме за день.\n\n"
         ) if mode == "industry_report" else ""
 
-    # Generate digest via LLM
-    digest_text = await generate_digest_text(summaries)
+    # Generate digest via LLM (user_prompt передаётся для инструкций: фильтр + формат, напр. «Пиши главную новость на английском»)
+    digest_text = await generate_digest_text(summaries, user_prompt=user_prompt or None)
 
     if digest_text:
         digest_text = digest_fallback_note + _inject_curated_links_inline(digest_text, summaries)
