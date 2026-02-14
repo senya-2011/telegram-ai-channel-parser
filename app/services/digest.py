@@ -239,11 +239,17 @@ async def generate_digest_for_user(
     report_posts = []
     trend_posts = []
     research_posts = []
+    tech_posts_fallback = []   # tech_update по типу, без жёсткого отбора по качеству
+    report_posts_fallback = []
     for post in unique_posts:
         cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+        kind = cluster.news_kind if cluster else "misc"
+        if kind == "tech_update":
+            tech_posts_fallback.append(post)
+        if kind == "industry_report":
+            report_posts_fallback.append(post)
         if not _is_digest_candidate(cluster):
             continue
-        kind = cluster.news_kind if cluster else "misc"
         if mode == "tech_update" and kind != "tech_update":
             continue
         if mode == "industry_report" and kind != "industry_report":
@@ -349,6 +355,78 @@ async def generate_digest_for_user(
             "user_relevance_score": user_relevance_score,
         })
 
+    fallback_used = False
+    if not summaries and mode == "tech_update" and tech_posts_fallback:
+        for post in tech_posts_fallback[:5]:
+            post_text = post.summary or post.content[:300]
+            if not _is_ai(post_text):
+                continue
+            source = await get_source_by_id(session, post.source_id)
+            source_title = source.title or source.identifier if source else "Неизвестный"
+            link = _get_post_link(source, post)
+            cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+            mentions = cluster.mention_count if cluster else 1
+            tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
+            analogs_text = cluster.analogs if cluster and cluster.analogs else ""
+            action_item = cluster.action_item if cluster and cluster.action_item else ""
+            news_kind = cluster.news_kind if cluster else "misc"
+            product_score = float(cluster.product_score) if cluster else 0.0
+            coreai_score = float(cluster.coreai_score) if cluster else 0.0
+            if not action_item and news_kind == "product":
+                action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
+            user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
+            summaries.append({
+                "source": source_title,
+                "summary": post_text,
+                "reactions": post.reactions_count,
+                "link": link,
+                "mentions": mentions,
+                "tags": tags_text,
+                "analogs": analogs_text,
+                "action_item": action_item,
+                "news_kind": news_kind,
+                "product_score": product_score,
+                "coreai_score": coreai_score,
+                "user_relevance_score": user_relevance_score,
+            })
+        if summaries:
+            fallback_used = True
+    if not summaries and mode == "industry_report" and report_posts_fallback:
+        for post in report_posts_fallback[:5]:
+            post_text = post.summary or post.content[:300]
+            if not _is_ai(post_text):
+                continue
+            source = await get_source_by_id(session, post.source_id)
+            source_title = source.title or source.identifier if source else "Неизвестный"
+            link = _get_post_link(source, post)
+            cluster = clusters_map.get(post.cluster_id) if post.cluster_id else None
+            mentions = cluster.mention_count if cluster else 1
+            tags_text = " ".join(tag for tag in (cluster.tags or "").split(",") if tag) if cluster else "#AIТехнологии"
+            analogs_text = cluster.analogs if cluster and cluster.analogs else ""
+            action_item = cluster.action_item if cluster and cluster.action_item else ""
+            news_kind = cluster.news_kind if cluster else "misc"
+            product_score = float(cluster.product_score) if cluster else 0.0
+            coreai_score = float(cluster.coreai_score) if cluster else 0.0
+            if not action_item and news_kind == "product":
+                action_item = "Снять фичу на декомпозицию: value, UX, метрики, срок пилота."
+            user_relevance_score = await score_user_prompt_relevance(post_text, user_prompt) if user_prompt else 0.5
+            summaries.append({
+                "source": source_title,
+                "summary": post_text,
+                "reactions": post.reactions_count,
+                "link": link,
+                "mentions": mentions,
+                "tags": tags_text,
+                "analogs": analogs_text,
+                "action_item": action_item,
+                "news_kind": news_kind,
+                "product_score": product_score,
+                "coreai_score": coreai_score,
+                "user_relevance_score": user_relevance_score,
+            })
+        if summaries:
+            fallback_used = True
+
     if not summaries:
         mode_human = {
             "main": "продуктовых",
@@ -361,11 +439,21 @@ async def generate_digest_for_user(
             "Следующий цикл парсинга добавит новые кандидаты."
         )
 
+    digest_fallback_note = ""
+    if fallback_used:
+        digest_fallback_note = (
+            "Релевантных технологических обновлений высокого качества не нашлось. "
+            "Ниже — подборка по теме за день.\n\n"
+        ) if mode == "tech_update" else (
+            "Релевантных отчётов и аналитики высокого качества не нашлось. "
+            "Ниже — подборка по теме за день.\n\n"
+        ) if mode == "industry_report" else ""
+
     # Generate digest via LLM
     digest_text = await generate_digest_text(summaries)
 
     if digest_text:
-        digest_text = _inject_curated_links_inline(digest_text, summaries)
+        digest_text = digest_fallback_note + _inject_curated_links_inline(digest_text, summaries)
         business_block = await _build_digest_business_impact_block(summaries)
 
         # Deterministic per-news section with inline tags (LLM output may reorder/omit markers).
@@ -385,7 +473,7 @@ async def generate_digest_for_user(
         digest_text += business_block + per_news_section
     else:
         # Fallback: simple list with links, HTML format
-        digest_text = "📰 <b>Дайджест за сегодня:</b>\n\n"
+        digest_text = digest_fallback_note + "📰 <b>Дайджест за сегодня:</b>\n\n"
         for i, s in enumerate(summaries[:10], 1):
             link_text = f'\n🔗 <a href="{s["link"]}">Оригинал</a>' if s["link"] else ""
             mentions_text = f", {s['mentions']} источн." if s.get("mentions", 1) >= 2 else ""

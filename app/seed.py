@@ -34,6 +34,16 @@ DEFAULT_WEB_SOURCES = [
     ("https://huggingface.co/blog", "Hugging Face Blog"),
 ]
 
+# Отчёты и аналитика — McKinsey, BCG, Gartner, Deloitte (RSS/блоги)
+DEFAULT_REPORT_SOURCES = [
+    ("https://www.mckinsey.com/capabilities/mckinsey-digital/our-insights", "McKinsey — Digital Insights"),
+    ("https://www.mckinsey.com/featured-insights", "McKinsey — Featured Insights"),
+    ("https://www.bcg.com/publications", "BCG — Publications"),
+    ("https://www.gartner.com/en/newsroom", "Gartner — Newsroom"),
+    ("https://www2.deloitte.com/global/en/insights.html", "Deloitte — Insights"),
+    ("https://www.mckinsey.com/industries/technology-media-and-telecommunications/our-insights", "McKinsey — TMT"),
+]
+
 # Default API sources — AI-focused feeds with strong signal
 DEFAULT_REDDIT_SOURCES = [
     ("MachineLearning", "Reddit r/MachineLearning"),
@@ -88,6 +98,16 @@ async def seed_defaults():
                 is_default=True,
             )
             logger.info(f"  [web] {url} -> id={source.id}")
+
+        for url, title in DEFAULT_REPORT_SOURCES:
+            source = await get_or_create_source(
+                session,
+                source_type="web",
+                identifier=url,
+                title=title,
+                is_default=True,
+            )
+            logger.info(f"  [web/reports] {url} -> id={source.id}")
 
         for identifier, title in DEFAULT_REDDIT_SOURCES:
             source = await get_or_create_source(
